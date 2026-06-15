@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Runtime data
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets / local config
+.env
+.env.*
+.app_secret
+*.pem
+*.key
+*.crt
+
+# Logs / backups / releases
+logs/
+*.log
+backups/
+releases/
+release/
+*.tar.gz
+*.zip
+*.sha256
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local test/export output
+exports/
+tmp/
+*.xlsx
+*.csv
