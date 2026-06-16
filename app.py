@@ -1179,6 +1179,119 @@ def ensure_cellular_monitor_tables(profile_id=None):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cellular_events_net_device ON cellular_events(net_device_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cellular_events_event_type ON cellular_events(event_type)")
 
+        # v5.1.0 OpenCellID reference and cellular identity history tables.
+        # OpenCellID is global reference data, not profile/customer-specific data.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS opencellid_imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_file TEXT,
+                imported_at TEXT,
+                rows_seen INTEGER DEFAULT 0,
+                rows_inserted INTEGER DEFAULT 0,
+                rows_updated INTEGER DEFAULT 0,
+                rows_skipped INTEGER DEFAULT 0,
+                status TEXT,
+                notes TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS opencellid_cells (
+                radio TEXT,
+                mcc TEXT NOT NULL,
+                mnc TEXT NOT NULL,
+                area TEXT,
+                tac TEXT NOT NULL,
+                cell_id TEXT NOT NULL,
+                unit TEXT,
+                lon REAL,
+                lat REAL,
+                range_m INTEGER,
+                samples INTEGER,
+                changeable INTEGER,
+                created INTEGER,
+                updated INTEGER,
+                average_signal INTEGER,
+                source_file TEXT,
+                imported_at TEXT,
+                PRIMARY KEY (mcc, mnc, tac, cell_id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cellular_identity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                profile_id INTEGER DEFAULT 1,
+                router_id TEXT,
+                router_name TEXT,
+                net_device_id TEXT,
+                sim_label TEXT,
+
+                mcc TEXT,
+                mnc TEXT,
+                tac TEXT,
+                cell_id TEXT,
+                identity_key TEXT,
+
+                service_type TEXT,
+                rfband TEXT,
+                rfband5g TEXT,
+                rfchannel TEXT,
+                ltebandwidth TEXT,
+                mtu TEXT,
+
+                first_seen_ts TEXT,
+                last_seen_ts TEXT,
+                last_sample_ts TEXT,
+                sample_count INTEGER DEFAULT 0,
+
+                is_current INTEGER DEFAULT 0,
+                closed_at TEXT,
+
+                match_status TEXT DEFAULT 'unmatched',
+                match_updated_at TEXT,
+
+                opencellid_mcc TEXT,
+                opencellid_mnc TEXT,
+                opencellid_tac TEXT,
+                opencellid_cell_id TEXT,
+                opencellid_lat REAL,
+                opencellid_lon REAL,
+                opencellid_range_m INTEGER,
+                opencellid_samples INTEGER,
+                opencellid_updated INTEGER,
+
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_opencellid_lookup
+            ON opencellid_cells(mcc, mnc, tac, cell_id)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_opencellid_mcc_mnc
+            ON opencellid_cells(mcc, mnc)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cellular_identity_history_router_seen
+            ON cellular_identity_history(profile_id, router_id, last_seen_ts)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cellular_identity_history_net_device_current
+            ON cellular_identity_history(net_device_id, is_current)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cellular_identity_history_identity
+            ON cellular_identity_history(mcc, mnc, tac, cell_id)
+        """)
+
         for table_name in ("net_device_metrics", "cellular_current_state"):
             for col_name, col_type in (
                 ("rfband", "TEXT"),
