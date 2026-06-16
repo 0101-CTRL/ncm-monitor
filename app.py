@@ -1851,6 +1851,7 @@ def stock_page(title, body):
     }}
   
 
+
 </style>
 </head>
 <body>
@@ -12559,6 +12560,11 @@ async def router_view(
     .chart-box canvas {{
       display:block;
       box-sizing:border-box;
+      cursor: crosshair !important;
+    }}
+
+    .chart-box:hover {{
+      cursor: crosshair;
     }}
     .no-data-overlay {{
       position:absolute;
@@ -13552,6 +13558,8 @@ function updateSingleChartRangeControls(kind) {{
       if (customWrap) customWrap.style.display = select.value === 'custom' ? 'inline-flex' : 'none';
     }});
   }}
+
+  updateChartZoomResetControl(kind);
 }}
 
 function updateAllChartRangeControls() {{
@@ -13627,6 +13635,354 @@ function applyRangeStateFromControls(kind) {{
 
   if (status) status.textContent = '';
   return true;
+}}
+
+
+function chartRangeStateCopy(kind) {{
+  ensureChartRanges();
+  const state = window.chartRanges[kind] || {{ mode: '30', startDate: null, endDate: null }};
+  return {{
+    mode: state.mode || '30',
+    startDate: state.startDate || null,
+    endDate: state.endDate || null
+  }};
+}}
+
+function setChartRangeControlsFromState(kind, state) {{
+  const select = document.getElementById(kind + 'RangeSelect');
+  const customWrap = document.getElementById(kind + 'CustomRangeInputs');
+  const startEl = document.getElementById(kind + 'StartDate');
+  const endEl = document.getElementById(kind + 'EndDate');
+
+  if (select) select.value = state.mode || '30';
+
+  if (customWrap) {{
+    customWrap.style.display = state.mode === 'custom' ? 'inline-flex' : 'none';
+  }}
+
+  if (startEl) startEl.value = state.startDate || '';
+  if (endEl) endEl.value = state.endDate || '';
+}}
+
+function updateChartZoomResetControl(kind) {{
+  const btn = document.getElementById(kind + 'ResetZoomButton');
+  if (!btn) return;
+
+  window.chartZoomOriginals = window.chartZoomOriginals || {{}};
+  btn.style.display = window.chartZoomOriginals[kind] ? 'inline-flex' : 'none';
+}}
+
+async function applyChartDragZoom(kind, startDate, endDate) {{
+  ensureChartRanges();
+
+  if (!startDate || !endDate) return;
+
+  const start = String(startDate).slice(0, 10);
+  const end = String(endDate).slice(0, 10);
+
+  const startObj = new Date(start + 'T00:00:00Z');
+  const endObj = new Date(end + 'T00:00:00Z');
+  const diffDays = Math.floor((endObj - startObj) / 86400000) + 1;
+
+  const status = document.getElementById(kind + 'RangeStatus');
+
+  if (Number.isNaN(diffDays) || diffDays < 1) {{
+    if (status) status.textContent = 'Drag zoom selection was not valid.';
+    return;
+  }}
+
+  if (diffDays > 90) {{
+    if (status) status.textContent = 'Drag zoom range cannot exceed 90 days.';
+    return;
+  }}
+
+  window.chartZoomOriginals = window.chartZoomOriginals || {{}};
+
+  if (!window.chartZoomOriginals[kind]) {{
+    window.chartZoomOriginals[kind] = normalizeChartRangeState(
+      chartRangeStateCopy(kind) || getSavedChartRangePreference(kind) || {{ mode: '30', startDate: null, endDate: null }}
+    );
+  }}
+
+  window.chartRanges[kind] = {{
+    mode: 'custom',
+    startDate: start,
+    endDate: end
+  }};
+
+  setChartRangeControlsFromState(kind, window.chartRanges[kind]);
+  updateChartZoomResetControl(kind);
+
+  if (status) status.textContent = 'Zooming to ' + start + ' to ' + end + '...';
+
+  await applyChartRange(kind);
+
+  if (status) status.textContent = 'Zoomed: ' + start + ' to ' + end;
+}}
+
+
+function chartRangeStorageKey() {{
+  const profileId = typeof getRouterPageProfileId === 'function'
+    ? getRouterPageProfileId()
+    : (typeof activeProfileId === 'function' ? activeProfileId() : '1');
+
+  return `ncm-monitor:router-chart-ranges:{router_id}:profile:${{profileId || '1'}}`;
+}}
+
+function getSavedChartRangePreference(kind) {{
+  try {{
+    const raw = localStorage.getItem(chartRangeStorageKey());
+    const saved = raw ? JSON.parse(raw) : {{}};
+    const state = saved && saved[kind] ? saved[kind] : null;
+
+    if (state && state.mode) {{
+      return {{
+        mode: String(state.mode || '30'),
+        startDate: state.startDate || null,
+        endDate: state.endDate || null
+      }};
+    }}
+  }} catch (e) {{
+    console.warn('Unable to read saved chart range preference:', e);
+  }}
+
+  return null;
+}}
+
+function saveChartRangePreference(kind, state) {{
+  try {{
+    const key = chartRangeStorageKey();
+    const raw = localStorage.getItem(key);
+    const saved = raw ? JSON.parse(raw) : {{}};
+
+    saved[kind] = {{
+      mode: state.mode || '30',
+      startDate: state.mode === 'custom' ? (state.startDate || null) : null,
+      endDate: state.mode === 'custom' ? (state.endDate || null) : null
+    }};
+
+    localStorage.setItem(key, JSON.stringify(saved));
+  }} catch (e) {{
+    console.warn('Unable to save chart range preference:', e);
+  }}
+}}
+
+function normalizeChartRangeState(state) {{
+  if (!state || !state.mode) {{
+    return {{ mode: '30', startDate: null, endDate: null }};
+  }}
+
+  const mode = String(state.mode || '30');
+
+  if (mode === 'custom') {{
+    if (state.startDate && state.endDate) {{
+      return {{
+        mode: 'custom',
+        startDate: String(state.startDate).slice(0, 10),
+        endDate: String(state.endDate).slice(0, 10)
+      }};
+    }}
+
+    return {{ mode: '30', startDate: null, endDate: null }};
+  }}
+
+  return {{ mode, startDate: null, endDate: null }};
+}}
+
+function fallbackChartResetState(kind) {{
+  return normalizeChartRangeState(
+    getSavedChartRangePreference(kind) || {{ mode: '30', startDate: null, endDate: null }}
+  );
+}}
+
+async function resetChartZoom(kind) {{
+  ensureChartRanges();
+
+  window.chartZoomOriginals = window.chartZoomOriginals || {{}};
+
+  const btn = document.getElementById(kind + 'ResetZoomButton');
+  const status = document.getElementById(kind + 'RangeStatus');
+
+  const original = normalizeChartRangeState(
+    window.chartZoomOriginals[kind] || fallbackChartResetState(kind)
+  );
+
+  window.chartRanges[kind] = original;
+  setChartRangeControlsFromState(kind, original);
+
+  if (btn) {{
+    btn.disabled = true;
+    btn.dataset.originalText = btn.dataset.originalText || btn.textContent || 'Reset zoom';
+    btn.textContent = 'Resetting...';
+  }}
+
+  if (status) status.textContent = 'Resetting zoom...';
+
+  try {{
+    await applyChartRange(kind, {{ cacheOnly: true }});
+
+    saveChartRangePreference(kind, original);
+    delete window.chartZoomOriginals[kind];
+
+    updateChartZoomResetControl(kind);
+
+    if (btn) {{
+      btn.disabled = false;
+      btn.textContent = 'Reset ✓';
+      window.setTimeout(() => {{
+        btn.textContent = btn.dataset.originalText || 'Reset zoom';
+      }}, 1200);
+    }}
+
+    if (status) {{
+      status.textContent = original.mode === 'custom'
+        ? 'Reset: ' + (original.startDate || '') + ' to ' + (original.endDate || '')
+        : '';
+    }}
+  }} catch (e) {{
+    console.error('Reset chart zoom failed:', e);
+
+    if (btn) {{
+      btn.disabled = false;
+      btn.textContent = btn.dataset.originalText || 'Reset zoom';
+    }}
+
+    if (status) status.textContent = 'Reset zoom failed.';
+  }}
+}}
+
+function chartDragZoomLabelIndex(chart, pixelX) {{
+  const labels = chart?.data?.labels || [];
+  const xScale = chart?.scales?.x;
+
+  if (!labels.length || !xScale || typeof xScale.getValueForPixel !== 'function') return null;
+
+  let raw = xScale.getValueForPixel(pixelX);
+  let idx = null;
+
+  if (typeof raw === 'number') {{
+    idx = Math.round(raw);
+  }} else if (raw !== null && raw !== undefined) {{
+    idx = labels.indexOf(String(raw));
+  }}
+
+  if (idx === null || Number.isNaN(idx)) return null;
+  return Math.max(0, Math.min(labels.length - 1, idx));
+}}
+
+const chartDragZoomPlugin = {{
+  id: 'chartDragZoom',
+
+  afterEvent(chart, args, pluginOptions) {{
+    const opts = chart?.options?.plugins?.chartDragZoom || {{}};
+    if (!opts.enabled || !opts.kind) return;
+
+    const e = args.event;
+    const area = chart.chartArea;
+    if (!e || !area) return;
+
+    const state = chart.$dragZoom || {{
+      dragging: false,
+      startX: null,
+      currentX: null,
+      suppressClick: false
+    }};
+
+    chart.$dragZoom = state;
+
+    const insideX = e.x >= area.left && e.x <= area.right;
+    const insideY = e.y >= area.top && e.y <= area.bottom;
+
+    if (e.type === 'mousedown' && insideX && insideY) {{
+      state.dragging = true;
+      state.startX = e.x;
+      state.currentX = e.x;
+      state.suppressClick = false;
+      args.changed = true;
+      return;
+    }}
+
+    if (e.type === 'mousemove' && state.dragging) {{
+      state.currentX = Math.max(area.left, Math.min(area.right, e.x));
+      args.changed = true;
+      return;
+    }}
+
+    if ((e.type === 'mouseup' || e.type === 'mouseout') && state.dragging) {{
+      const startX = state.startX;
+      const endX = Math.max(area.left, Math.min(area.right, state.currentX ?? e.x));
+      const distance = Math.abs(endX - startX);
+
+      state.dragging = false;
+      state.currentX = null;
+
+      if (distance < 10) {{
+        args.changed = true;
+        return;
+      }}
+
+      const leftX = Math.min(startX, endX);
+      const rightX = Math.max(startX, endX);
+      const startIdx = chartDragZoomLabelIndex(chart, leftX);
+      const endIdx = chartDragZoomLabelIndex(chart, rightX);
+      const labels = chart?.data?.labels || [];
+
+      if (startIdx === null || endIdx === null || !labels[startIdx] || !labels[endIdx]) {{
+        args.changed = true;
+        return;
+      }}
+
+      const startDate = String(labels[Math.min(startIdx, endIdx)]).slice(0, 10);
+      const endDate = String(labels[Math.max(startIdx, endIdx)]).slice(0, 10);
+
+      if (!startDate || !endDate || startDate === endDate) {{
+        const status = document.getElementById(opts.kind + 'RangeStatus');
+        if (status) status.textContent = 'Drag across at least two date ticks to zoom.';
+        args.changed = true;
+        return;
+      }}
+
+      state.suppressClick = true;
+      args.changed = true;
+
+      window.setTimeout(() => {{
+        applyChartDragZoom(opts.kind, startDate, endDate).catch(err => {{
+          console.error('Chart drag zoom failed:', err);
+          const status = document.getElementById(opts.kind + 'RangeStatus');
+          if (status) status.textContent = 'Drag zoom failed.';
+        }});
+      }}, 0);
+
+      return;
+    }}
+  }},
+
+  afterDraw(chart, args, pluginOptions) {{
+    const opts = chart?.options?.plugins?.chartDragZoom || {{}};
+    if (!opts.enabled) return;
+
+    const state = chart.$dragZoom;
+    const area = chart.chartArea;
+
+    if (!state || !state.dragging || state.startX === null || state.currentX === null || !area) return;
+
+    const ctx = chart.ctx;
+    const left = Math.max(area.left, Math.min(state.startX, state.currentX));
+    const right = Math.min(area.right, Math.max(state.startX, state.currentX));
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(56,189,248,0.18)';
+    ctx.strokeStyle = 'rgba(125,211,252,0.85)';
+    ctx.lineWidth = 1;
+    ctx.fillRect(left, area.top, Math.max(1, right - left), area.bottom - area.top);
+    ctx.strokeRect(left, area.top, Math.max(1, right - left), area.bottom - area.top);
+    ctx.restore();
+  }}
+}};
+
+if (window.Chart && !window.__chartDragZoomPluginRegistered) {{
+  Chart.register(chartDragZoomPlugin);
+  window.__chartDragZoomPluginRegistered = true;
 }}
 
 
@@ -14269,6 +14625,7 @@ async function loadRouter() {{
           <input id="signalEndDate" type="date" style="width:auto;margin:0;">
         </span>
         <button id="signalApplyButton" class="primary" onclick="applyChartRangeButton(\'signal\', this)">Apply</button>
+        <button id="signalResetZoomButton" type="button" onclick="resetChartZoom(\'signal\')" style="display:none;">Reset zoom</button>
         <span id="signalRangeStatus" class="small"></span>
       </div>
       <div id="signalHistoryNote" class="small" style="display:none;margin:8px 0 10px;color:#facc15;"></div>
@@ -14293,6 +14650,7 @@ async function loadRouter() {{
           <input id="usageEndDate" type="date" style="width:auto;margin:0;">
         </span>
         <button id="usageApplyButton" class="primary" onclick="applyChartRangeButton(\'usage\', this)">Apply</button>
+        <button id="usageResetZoomButton" type="button" onclick="resetChartZoom(\'usage\')" style="display:none;">Reset zoom</button>
         <span id="usageRangeStatus" class="small"></span>
       </div>
       <label class="small" style="display:inline-flex;align-items:center;gap:8px;margin:0 0 12px 0;cursor:pointer;">
@@ -14323,6 +14681,7 @@ async function loadRouter() {{
           <input id="alertEndDate" type="date" style="width:auto;margin:0;">
         </span>
         <button id="alertApplyButton" class="primary" onclick="applyChartRangeButton(\'alert\', this)">Apply</button>
+        <button id="alertResetZoomButton" type="button" onclick="resetChartZoom(\'alert\')" style="display:none;">Reset zoom</button>
         <span id="alertRangeStatus" class="small"></span>
       </div>
       <div id="alertHistoryNote" class="small" style="display:none;margin:8px 0 10px;color:#facc15;"></div>
@@ -14774,12 +15133,17 @@ function renderSignalChart(rows, cellularEvents, selectedDays, startDate, endDat
       responsive: true,
       maintainAspectRatio: false,
       devicePixelRatio: window.devicePixelRatio || 2,
+      events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove', 'mousedown', 'mouseup'],
       interaction: {{
         mode: 'nearest',
         intersect: false
       }},
       onClick: function(evt, elements, chart) {{
-        const points = chart.getElementsAtEventForMode(evt, 'nearest', {{ intersect: false }}, true);
+        if (chart && chart.$dragZoom && chart.$dragZoom.suppressClick) {{
+          chart.$dragZoom.suppressClick = false;
+          return;
+        }}
+        const points = chart.getElementsAtEventForMode(evt, 'nearest', {{ intersect: true }}, true);
         if (!points || !points.length) return;
         const point = points[0];
         const ds = chart.data.datasets[point.datasetIndex] || {{}};
@@ -14798,6 +15162,7 @@ function renderSignalChart(rows, cellularEvents, selectedDays, startDate, endDat
         openEventContextPanel(ds.label || 'Signal chart target', chartDayAnchorUtc(day), 720, 720, 'daily');
       }},
       plugins: {{
+        chartDragZoom: {{ enabled: true, kind: 'signal' }},
         historyStartLine: historyInfo ? {{
           timestamp: historyInfo.oldest,
           labelValue: historyInfo.labelValue,
@@ -14989,15 +15354,17 @@ function buildDayLabels(days, startDate, endDate) {{
       responsive: true,
       maintainAspectRatio: false,
       devicePixelRatio: window.devicePixelRatio || 2,
+      events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove', 'mousedown', 'mouseup'],
       interaction: {{
         mode: 'index',
         intersect: false
       }},
       onClick: function(evt, elements, chart) {{
-        let points = chart.getElementsAtEventForMode(evt, 'nearest', {{ intersect: true }}, true);
-        if (!points || !points.length) {{
-          points = chart.getElementsAtEventForMode(evt, 'index', {{ intersect: false }}, true);
+        if (chart && chart.$dragZoom && chart.$dragZoom.suppressClick) {{
+          chart.$dragZoom.suppressClick = false;
+          return;
         }}
+        const points = chart.getElementsAtEventForMode(evt, 'nearest', {{ intersect: true }}, true);
         if (!points || !points.length) return;
         const point = points[0];
         const ds = chart.data.datasets[point.datasetIndex] || {{}};
@@ -15005,6 +15372,7 @@ function buildDayLabels(days, startDate, endDate) {{
         openEventContextPanel(ds.label || 'Usage chart target', chartDayAnchorUtc(day), 720, 720, 'daily');
       }},
       plugins: {{
+          chartDragZoom: {{ enabled: true, kind: 'usage' }},
           historyStartLine: earliestUsageMarkerTimestamp ? {{
             timestamp: earliestUsageMarkerTimestamp,
             labelValue: earliestUsageMarkerDay,
@@ -15089,11 +15457,13 @@ function renderAlertChart(rows, selectedDays, startDate, endDate) {{
       responsive: true,
       maintainAspectRatio: false,
       devicePixelRatio: window.devicePixelRatio || 2,
+      events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove', 'mousedown', 'mouseup'],
       onClick: function(evt, elements, chart) {{
-        let points = chart.getElementsAtEventForMode(evt, 'nearest', {{ intersect: true }}, true);
-        if (!points || !points.length) {{
-          points = chart.getElementsAtEventForMode(evt, 'index', {{ intersect: false }}, true);
+        if (chart && chart.$dragZoom && chart.$dragZoom.suppressClick) {{
+          chart.$dragZoom.suppressClick = false;
+          return;
         }}
+        const points = chart.getElementsAtEventForMode(evt, 'nearest', {{ intersect: true }}, true);
         if (!points || !points.length) return;
         const point = points[0];
         const ds = chart.data.datasets[point.datasetIndex] || {{}};
@@ -15101,6 +15471,7 @@ function renderAlertChart(rows, selectedDays, startDate, endDate) {{
         openEventContextPanel(ds.label || 'Alert chart target', chartDayAnchorUtc(day), 720, 720, 'daily');
       }},
       plugins: {{
+        chartDragZoom: {{ enabled: true, kind: 'alert' }},
         historyStartLine: historyInfo ? {{
           timestamp: historyInfo.oldest,
           labelValue: historyInfo.labelValue,
