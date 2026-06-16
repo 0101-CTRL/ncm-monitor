@@ -2203,14 +2203,29 @@ def build_tower_handoff_analysis(history, since_dt, until_dt, hours):
         timeline.append(entry)
 
         if handoff_from_previous:
+            detected_at = entry["first_seen_ts"]
+            event_id = f"tower-handoff-{len(handoff_events) + 1}"
             handoff_events.append({
-                "detected_at": entry["first_seen_ts"],
+                "event_id": event_id,
+                "event_type": "tower_handoff",
+                "detected_at": detected_at,
+                "detected_at_local": to_local_string(detected_at),
                 "from_tower_key": previous_key,
                 "to_tower_key": key,
                 "to_sim_label": item.get("sim_label"),
+                "to_net_device_id": item.get("net_device_id"),
+                "to_connection_state": iface.get("connection_state"),
+                "to_carrier": iface.get("carrier"),
+                "to_service_type": radio.get("service_type"),
+                "to_band": radio.get("rfband"),
+                "to_channel": radio.get("rfchannel"),
                 "to_rf_quality": rf.get("quality"),
                 "to_rf_basis": rf.get("basis"),
                 "to_rf_value": rf.get("value"),
+                "to_rsrp": ((rf.get("last") or {}).get("rsrp")),
+                "to_rsrq": ((rf.get("last") or {}).get("rsrq")),
+                "to_sinr": ((rf.get("last") or {}).get("sinr")),
+                "to_dbm": ((rf.get("last") or {}).get("dbm")),
             })
 
         previous = item
@@ -15754,6 +15769,157 @@ async function refreshTowerLocationContext() {{
   }}
 }}
 
+
+function towerLocalTime(value) {{
+  if (!value) return 'n/a';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleString();
+}}
+
+function towerMetricText(label, value) {{
+  if (value === null || value === undefined || value === '') return '';
+  return `${{label}} ${{escapeHtml(value)}}`;
+}}
+
+function renderTowerHandoffAnalysis(towerHistory) {{
+  const analysis = towerHistory?.analysis || {{}};
+  const stability = analysis.stability || {{}};
+  const timeline = analysis.timeline || [];
+  const handoffs = analysis.handoff_events || [];
+
+  const stabilityLabel = stability.label || 'Unknown';
+  const stabilityDesc = stability.description || 'No tower stability analysis is available yet.';
+  const handoffsPerDay = stability.handoffs_per_24h ?? 'n/a';
+
+  const handoffRows = handoffs.length ? handoffs.map(h => `
+    <tr
+      style="cursor:pointer;"
+      title="Click later to inspect router logs around this handoff"
+      data-anchor-utc="${{escapeHtml(h.detected_at || '')}}"
+      data-event-id="${{escapeHtml(h.event_id || '')}}"
+    >
+      <td>${{escapeHtml(h.detected_at_local || towerLocalTime(h.detected_at))}}</td>
+      <td>
+        <div><b>${{escapeHtml(h.from_tower_key || 'previous tower')}}</b></div>
+        <div class="small">→ ${{escapeHtml(h.to_tower_key || 'new tower')}}</div>
+      </td>
+      <td>
+        <span class="${{towerQualityClass(h.to_rf_quality)}}">${{escapeHtml(towerTitleCase(h.to_rf_quality || 'unknown'))}}</span>
+        <div class="small">${{escapeHtml(String(h.to_rf_basis || '').toUpperCase())}} ${{escapeHtml(h.to_rf_value ?? 'n/a')}}</div>
+      </td>
+      <td>
+        <div>${{escapeHtml(h.to_sim_label || 'SIM')}}</div>
+        <div class="small">${{escapeHtml(h.to_carrier || 'carrier n/a')}} · ${{escapeHtml(h.to_connection_state || 'state n/a')}}</div>
+      </td>
+      <td>
+        <div>${{escapeHtml(h.to_service_type || 'service n/a')}}</div>
+        <div class="small">Band ${{escapeHtml(h.to_band || 'n/a')}} · CH ${{escapeHtml(h.to_channel || 'n/a')}}</div>
+      </td>
+    </tr>
+  `).join('') : `
+    <tr>
+      <td colspan="5" class="small">
+        No tower handoffs were detected in this window. Current behavior appears stable based on recorded serving-cell identity windows.
+      </td>
+    </tr>
+  `;
+
+  const timelineRows = timeline.length ? timeline.map(t => `
+    <tr>
+      <td>${{escapeHtml(t.sequence || '')}}</td>
+      <td>
+        <div><b>${{escapeHtml(t.tower_key || 'n/a')}}</b></div>
+        <div class="small">${{escapeHtml(t.match_status || 'unmatched')}} · ${{t.tower_found ? 'tower mapped' : 'tower unmapped'}}</div>
+      </td>
+      <td>
+        <div>${{escapeHtml(t.duration_label || 'n/a')}}</div>
+        <div class="small">${{t.is_current ? 'current' : 'historical'}}</div>
+      </td>
+      <td>
+        <span class="${{towerQualityClass(t.rf_quality)}}">${{escapeHtml(towerTitleCase(t.rf_quality || 'unknown'))}}</span>
+        <div class="small">
+          ${{[towerMetricText('SINR', t.sinr), towerMetricText('RSRP', t.rsrp), towerMetricText('RSRQ', t.rsrq)].filter(Boolean).join(' · ')}}
+        </div>
+      </td>
+      <td>
+        <div>${{escapeHtml(t.sim_label || 'SIM')}} · ${{escapeHtml(t.connection_state || 'state n/a')}}</div>
+        <div class="small">${{escapeHtml(t.service_type || 'service n/a')}} · Band ${{escapeHtml(t.rfband || 'n/a')}}</div>
+      </td>
+    </tr>
+  `).join('') : `
+    <tr>
+      <td colspan="5" class="small">No observed tower timeline rows are available yet.</td>
+    </tr>
+  `;
+
+  return `
+    <div style="margin-top:14px;padding:12px;border:1px solid rgba(148,163,184,.22);border-radius:14px;background:rgba(15,23,42,.35);">
+      <h3 style="margin-top:0;">Tower Handoff Analysis</h3>
+      <div class="cellular-kpi-row">
+        <div class="cellular-kpi">
+          <div class="big">${{escapeHtml(stabilityLabel)}}</div>
+          <div class="label">Tower stability</div>
+          <div class="small" style="margin-top:6px;">${{escapeHtml(stabilityDesc)}}</div>
+        </div>
+        <div class="cellular-kpi">
+          <div class="big">${{escapeHtml(analysis.handoffs ?? 0)}}</div>
+          <div class="label">Handoffs</div>
+          <div class="small" style="margin-top:6px;">${{escapeHtml(handoffsPerDay)}} per 24h</div>
+        </div>
+        <div class="cellular-kpi">
+          <div class="big">${{escapeHtml(analysis.current_dwell_label || 'n/a')}}</div>
+          <div class="label">Current dwell time</div>
+          <div class="small" style="margin-top:6px;">Most-used: ${{escapeHtml(analysis.most_used_observed_label || 'n/a')}}</div>
+        </div>
+        <div class="cellular-kpi">
+          <div class="big">${{escapeHtml(analysis.unique_towers ?? 0)}}</div>
+          <div class="label">Unique towers</div>
+          <div class="small" style="margin-top:6px;">Source: ${{escapeHtml(String(analysis.source || '').replace('_', ' '))}}</div>
+        </div>
+      </div>
+
+      <details style="margin-top:12px;">
+        <summary style="cursor:pointer;color:#bfdbfe;font-weight:700;">Show handoff and dwell timeline</summary>
+
+        <h4>Handoff events</h4>
+        <table class="cellular-event-table">
+          <thead>
+            <tr>
+              <th>Detected</th>
+              <th>Handoff</th>
+              <th>RF after handoff</th>
+              <th>Interface</th>
+              <th>Radio</th>
+            </tr>
+          </thead>
+          <tbody>${{handoffRows}}</tbody>
+        </table>
+
+        <h4 style="margin-top:16px;">Observed tower timeline</h4>
+        <table class="cellular-event-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Tower</th>
+              <th>Dwell</th>
+              <th>RF</th>
+              <th>Interface</th>
+            </tr>
+          </thead>
+          <tbody>${{timelineRows}}</tbody>
+        </table>
+
+        <p class="small" style="margin-top:10px;">
+          This analysis is based on observed serving-cell identity windows. It is not continuous GPS movement tracking.
+          Next step will make handoff rows open router logs around the detected timestamp.
+        </p>
+      </details>
+    </div>
+  `;
+}}
+
+
 function renderTowerMappingCard(towerHistory) {{
   if (!towerHistory) {{
     return `
@@ -15868,6 +16034,8 @@ function renderTowerMappingCard(towerHistory) {{
         <span class="pill">Cell ${{escapeHtml(ident.cell_id || 'n/a')}}</span>
         <span class="pill">Band ${{escapeHtml(radio.rfband || 'n/a')}}</span>
       </div>
+
+      ${{renderTowerHandoffAnalysis(towerHistory)}}
 
       <details style="margin-top:12px;" ontoggle="handleTowerMapDetailsToggle(this)">
         <summary style="cursor:pointer;color:#bfdbfe;font-weight:700;">Show tower mapping details</summary>
