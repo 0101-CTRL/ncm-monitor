@@ -574,10 +574,17 @@ def classify_cellular_event(old_row, metric: dict) -> str:
 
 
 def _cellular_identity_value(value) -> str:
-    """Normalize cellular identity values for matching/storage."""
+    """Normalize cellular identity values for matching/storage.
+
+    NCM may return Cell ID as "21590529 (0x1497201)" while OpenCellID
+    stores the decimal value. Keep only the decimal portion for lookup/history.
+    """
     if value is None:
         return ""
-    return str(value).strip()
+    value = str(value).strip()
+    if " (0x" in value.lower():
+        value = value.split("(", 1)[0].strip()
+    return value
 
 
 def lookup_opencellid_cell(conn, mcc, mnc, tac, cell_id):
@@ -874,7 +881,9 @@ def record_cellular_metric_event(conn, router_id: str, net_device_id: str, metri
         profile_id = int(profile_id or 1)
     except Exception:
         profile_id = 1
+
     ensure_cellular_monitor_tables(profile_id)
+
     router_id = str(router_id)
     net_device_id = str(net_device_id)
 
