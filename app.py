@@ -15465,6 +15465,174 @@ function renderCellularMobilityCard(cellular) {{
 }}
 
 
+function towerQualityClass(quality) {{
+  const q = String(quality || '').toLowerCase();
+  if (q === 'excellent') return 'sig-excellent';
+  if (q === 'good') return 'sig-good';
+  if (q === 'fair') return 'sig-fair';
+  if (q === 'poor') return 'sig-poor';
+  return 'small';
+}}
+
+function towerTitleCase(value) {{
+  const s = String(value || 'unknown');
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : 'Unknown';
+}}
+
+function towerRfSummary(rf) {{
+  rf = rf || {{}};
+  const basis = String(rf.basis || 'none').toUpperCase();
+  if (!rf || rf.basis === 'none' || rf.value === null || rf.value === undefined) return 'No RF samples';
+  return `${{basis}} ${{escapeHtml(rf.value)}}`;
+}}
+
+async function refreshTowerLocationContext() {{
+  const s = document.getElementById('refreshStatus');
+  if (s) s.textContent = 'Refreshing tower map location context...';
+
+  try {{
+    const res = await fetch('/api/router/{router_id}/tower-history?profile_id=' + encodeURIComponent(activeProfileId()) + '&hours=168&refresh_location=true', {{cache:'no-store'}});
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (s) s.textContent = 'Tower map location context refreshed.';
+    await loadRouter();
+  }} catch (e) {{
+    if (s) s.textContent = 'Tower map location refresh failed: ' + String(e.message || e);
+  }}
+}}
+
+function renderTowerMappingCard(towerHistory) {{
+  if (!towerHistory) {{
+    return `
+      <div class="card">
+        <h2>Cell Tower Mapping</h2>
+        <p class="small">Tower mapping summary is not available yet.</p>
+      </div>
+    `;
+  }}
+
+  const summary = towerHistory.summary || {{}};
+  const cur = towerHistory.current || null;
+  const routerLoc = towerHistory.router_location || {{}};
+
+  if (!cur) {{
+    const locationText = routerLoc.found
+      ? `Router location available: ${{escapeHtml(routerLoc.lat)}}, ${{escapeHtml(routerLoc.lon)}}`
+      : 'Router location not cached yet.';
+
+    return `
+      <div class="card">
+        <h2>Cell Tower Mapping</h2>
+        <p class="small">
+          No current cellular identity history is available for this router in the selected dashboard profile.
+        </p>
+        <div class="cellular-kpi-row">
+          <div class="cellular-kpi">
+            <div class="big">0</div>
+            <div class="label">Current tower records</div>
+          </div>
+          <div class="cellular-kpi">
+            <div class="big">${{routerLoc.found ? 'Yes' : 'No'}}</div>
+            <div class="label">Router location</div>
+          </div>
+          <div class="cellular-kpi">
+            <div class="big">No</div>
+            <div class="label">Map ready</div>
+          </div>
+        </div>
+        <p class="small">${{locationText}}</p>
+        <button onclick="refreshTowerLocationContext()">Refresh location context</button>
+      </div>
+    `;
+  }}
+
+  const ident = cur.identity || {{}};
+  const radio = cur.radio || {{}};
+  const iface = cur.interface || {{}};
+  const tower = cur.tower || {{}};
+  const rf = cur.rf || {{}};
+  const map = cur.map || {{}};
+  const quality = String(rf.quality || 'unknown').toLowerCase();
+  const qualityLabel = towerTitleCase(quality);
+  const qualityClass = towerQualityClass(quality);
+
+  const towerMatchText = tower.found
+    ? 'Exact match'
+    : 'Unmatched';
+
+  const mapText = map.has_path
+    ? 'Ready'
+    : (!map.has_router_location ? 'Missing router location' : (!map.has_tower_location ? 'Missing tower match' : 'Not ready'));
+
+  const towerLocationText = tower.found
+    ? `${{escapeHtml(tower.lat)}}, ${{escapeHtml(tower.lon)}} · range ${{escapeHtml(tower.range_m ?? 'n/a')}}m · samples ${{escapeHtml(tower.samples ?? 'n/a')}}`
+    : 'No local OpenCellID match for this TAC/cell ID yet.';
+
+  const routerLocationText = routerLoc.found
+    ? `${{escapeHtml(routerLoc.lat)}}, ${{escapeHtml(routerLoc.lon)}} · ${{escapeHtml(routerLoc.method || 'unknown')}} · accuracy ${{escapeHtml(routerLoc.accuracy ?? 'n/a')}}m`
+    : escapeHtml(routerLoc.message || 'No cached router location is available.');
+
+  return `
+    <div class="card">
+      <h2>Cell Tower Mapping</h2>
+      <p class="small">
+        Uses locally recorded cellular identity history and imported OpenCellID data. Summary stays collapsed by default so tower detail does not take over the router page.
+      </p>
+
+      <div class="cellular-kpi-row">
+        <div class="cellular-kpi">
+          <div class="big">${{escapeHtml(cur.sim_label || 'SIM')}}</div>
+          <div class="label">Current modem</div>
+          <div class="small" style="margin-top:6px;">
+            ${{escapeHtml(iface.connection_state || 'state n/a')}} · ${{escapeHtml(iface.carrier || 'carrier n/a')}} · ${{escapeHtml(radio.service_type || 'service n/a')}}
+          </div>
+        </div>
+        <div class="cellular-kpi">
+          <div class="big">${{escapeHtml(towerMatchText)}}</div>
+          <div class="label">Tower match</div>
+          <div class="small" style="margin-top:6px;">
+            ${{escapeHtml(summary.exact_matches || 0)}} exact segment(s), ${{escapeHtml(summary.unique_towers || 0)}} unique tower(s)
+          </div>
+        </div>
+        <div class="cellular-kpi">
+          <div class="big"><span class="${{qualityClass}}">${{escapeHtml(qualityLabel)}}</span></div>
+          <div class="label">RF quality</div>
+          <div class="small" style="margin-top:6px;">${{towerRfSummary(rf)}}</div>
+        </div>
+        <div class="cellular-kpi">
+          <div class="big">${{escapeHtml(mapText)}}</div>
+          <div class="label">Map state</div>
+          <div class="small" style="margin-top:6px;">
+            Router ${{summary.has_router_location ? 'yes' : 'no'}} · Tower ${{summary.has_current_tower ? 'yes' : 'no'}}
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <span class="pill">MCC ${{escapeHtml(ident.mcc || 'n/a')}}</span>
+        <span class="pill">MNC ${{escapeHtml(ident.mnc || 'n/a')}}</span>
+        <span class="pill">${{escapeHtml(ident.area_label || 'Area')}} ${{escapeHtml(ident.area || ident.tac || 'n/a')}}</span>
+        <span class="pill">Cell ${{escapeHtml(ident.cell_id || 'n/a')}}</span>
+        <span class="pill">Band ${{escapeHtml(radio.rfband || 'n/a')}}</span>
+      </div>
+
+      <details style="margin-top:12px;">
+        <summary style="cursor:pointer;color:#bfdbfe;font-weight:700;">Show tower mapping details</summary>
+        <div class="small" style="margin-top:10px;line-height:1.55;">
+          <div><b>Router location:</b> ${{routerLocationText}}</div>
+          <div><b>Tower location:</b> ${{towerLocationText}}</div>
+          <div><b>Serving cell:</b> ${{escapeHtml(ident.tower_key || ident.identity_key || 'n/a')}}</div>
+          <div><b>Window:</b> ${{escapeHtml((cur.window || {{}}).first_seen_ts || 'n/a')}} → ${{escapeHtml((cur.window || {{}}).last_seen_ts || 'n/a')}}</div>
+          <div><b>RF:</b> RSRP ${{escapeHtml((rf.last || {{}}).rsrp ?? 'n/a')}} · RSRQ ${{escapeHtml((rf.last || {{}}).rsrq ?? 'n/a')}} · SINR ${{escapeHtml((rf.last || {{}}).sinr ?? 'n/a')}} · dBm ${{escapeHtml((rf.last || {{}}).dbm ?? 'n/a')}}</div>
+          <div><b>Playback window:</b> ${{escapeHtml(towerHistory.hours || 168)}} hours · ${{escapeHtml(summary.segments || 0)}} observed segment(s)</div>
+        </div>
+        <button style="margin-top:10px;" onclick="refreshTowerLocationContext()">Refresh location context</button>
+      </details>
+    </div>
+  `;
+}}
+
+
+
 function graphRangeParams() {{
   const params = new URLSearchParams();
   const mode = window.graphRangeMode || '30';
@@ -16600,6 +16768,14 @@ async function loadRouter() {{
     cellular = null;
   }}
 
+  let towerHistory = null;
+  try {{
+    const towerRes = await fetch('/api/router/{router_id}/tower-history?profile_id=' + encodeURIComponent(pid) + '&hours=168', {{cache:'no-store'}});
+    if (towerRes.ok) towerHistory = await towerRes.json();
+  }} catch (e) {{
+    towerHistory = null;
+  }}
+
   routerData = data;
   const content = document.getElementById('content');
 
@@ -16687,6 +16863,8 @@ async function loadRouter() {{
     <div class="grid">${{sims || '<div class="card"><p class="small">No SIM data found.</p></div>'}}</div>
 
     ${{renderCellularMobilityCard({{...(cellular || {{}}), recent_events: (cellular?.recent_events || []).filter(e => e.event_type !== '5g_service_mode_change')}})}}
+
+    ${{renderTowerMappingCard(towerHistory)}}
 
     ${{mapCard}}
 
