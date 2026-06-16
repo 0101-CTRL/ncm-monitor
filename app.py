@@ -14592,6 +14592,15 @@ async def router_view(
       object-fit: contain; filter: drop-shadow(0 24px 36px rgba(0,0,0,.45));
     }}
     #map {{ height: 420px; border-radius: 18px; overflow: hidden; }}
+    #towerMap {{ height: 360px; border-radius: 16px; overflow: hidden; border:1px solid #1e293b; background:#020617; }}
+    .tower-map-message {{
+      margin-top:10px;
+      padding:10px 12px;
+      border:1px solid rgba(148,163,184,.22);
+      border-radius:12px;
+      background:rgba(15,23,42,.45);
+      color:#cbd5e1;
+    }}
     .chart-box {{
       background:#020617;
       border-radius:12px;
@@ -15615,7 +15624,7 @@ function renderTowerMappingCard(towerHistory) {{
         <span class="pill">Band ${{escapeHtml(radio.rfband || 'n/a')}}</span>
       </div>
 
-      <details style="margin-top:12px;">
+      <details style="margin-top:12px;" ontoggle="handleTowerMapDetailsToggle(this)">
         <summary style="cursor:pointer;color:#bfdbfe;font-weight:700;">Show tower mapping details</summary>
         <div class="small" style="margin-top:10px;line-height:1.55;">
           <div><b>Router location:</b> ${{routerLocationText}}</div>
@@ -15625,10 +15634,131 @@ function renderTowerMappingCard(towerHistory) {{
           <div><b>RF:</b> RSRP ${{escapeHtml((rf.last || {{}}).rsrp ?? 'n/a')}} · RSRQ ${{escapeHtml((rf.last || {{}}).rsrq ?? 'n/a')}} · SINR ${{escapeHtml((rf.last || {{}}).sinr ?? 'n/a')}} · dBm ${{escapeHtml((rf.last || {{}}).dbm ?? 'n/a')}}</div>
           <div><b>Playback window:</b> ${{escapeHtml(towerHistory.hours || 168)}} hours · ${{escapeHtml(summary.segments || 0)}} observed segment(s)</div>
         </div>
+        <div style="margin-top:14px;">
+          <h3 style="margin-bottom:8px;">Tower map</h3>
+          <div id="towerMapMessage" class="tower-map-message">Expand details to initialize the tower map.</div>
+          <div id="towerMap" style="display:none;margin-top:10px;"></div>
+        </div>
         <button style="margin-top:10px;" onclick="refreshTowerLocationContext()">Refresh location context</button>
       </details>
     </div>
   `;
+}}
+
+
+
+let towerMapObj = null;
+let towerMapLineObj = null;
+let towerMapRouterMarkerObj = null;
+let towerMapTowerMarkerObj = null;
+
+function resetTowerMappingMap() {{
+  if (towerMapObj) {{
+    try {{ towerMapObj.remove(); }} catch (e) {{}}
+  }}
+  towerMapObj = null;
+  towerMapLineObj = null;
+  towerMapRouterMarkerObj = null;
+  towerMapTowerMarkerObj = null;
+}}
+
+function handleTowerMapDetailsToggle(detailsEl) {{
+  if (!detailsEl || !detailsEl.open) return;
+  window.setTimeout(() => initializeTowerMappingMap(), 80);
+}}
+
+function initializeTowerMappingMap() {{
+  const towerHistory = window.currentTowerHistory || null;
+  const box = document.getElementById('towerMap');
+  const msg = document.getElementById('towerMapMessage');
+  if (!box) return;
+
+  const cur = towerHistory && towerHistory.current ? towerHistory.current : null;
+  const mapInfo = cur && cur.map ? cur.map : null;
+  const tower = cur && cur.tower ? cur.tower : null;
+  const rf = cur && cur.rf ? cur.rf : {{}};
+  const ident = cur && cur.identity ? cur.identity : {{}};
+
+  if (!mapInfo || !mapInfo.has_path) {{
+    if (msg) {{
+      if (!towerHistory) {{
+        msg.textContent = 'Tower map data is not loaded yet.';
+      }} else if (!cur) {{
+        msg.textContent = 'No current serving cell is available for this router.';
+      }} else if (!mapInfo.has_router_location) {{
+        msg.textContent = 'Router location is missing. Refresh location context or enable the Location module.';
+      }} else if (!mapInfo.has_tower_location) {{
+        msg.textContent = 'Tower location is missing. Import or rematch OpenCellID data for this TAC/cell ID.';
+      }} else {{
+        msg.textContent = 'Tower map is not ready yet.';
+      }}
+    }}
+    resetTowerMappingMap();
+    box.style.display = 'none';
+    return;
+  }}
+
+  box.style.display = 'block';
+  if (msg) msg.textContent = 'Router-to-tower path is based on observed serving-cell identity windows, not continuous router movement.';
+
+  const routerLat = Number(mapInfo.router_lat);
+  const routerLon = Number(mapInfo.router_lon);
+  const towerLat = Number(mapInfo.tower_lat);
+  const towerLon = Number(mapInfo.tower_lon);
+
+  if ([routerLat, routerLon, towerLat, towerLon].some(v => Number.isNaN(v))) {{
+    if (msg) msg.textContent = 'Tower map coordinates are incomplete.';
+    resetTowerMappingMap();
+    box.style.display = 'none';
+    return;
+  }}
+
+  resetTowerMappingMap();
+
+  towerMapObj = L.map('towerMap');
+  L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
+  }}).addTo(towerMapObj);
+
+  const lineColor = mapInfo.line_color || (rf && rf.line_color) || '#38bdf8';
+
+  towerMapRouterMarkerObj = L.marker([routerLat, routerLon])
+    .addTo(towerMapObj)
+    .bindPopup(`Router {router_id}<br>${{escapeHtml(String(routerLat))}}, ${{escapeHtml(String(routerLon))}}`);
+
+  towerMapTowerMarkerObj = L.circleMarker([towerLat, towerLon], {{
+    radius: 9,
+    color: lineColor,
+    fillColor: lineColor,
+    fillOpacity: 0.75,
+    weight: 2
+  }})
+    .addTo(towerMapObj)
+    .bindPopup(
+      `Current serving tower<br>` +
+      `MCC ${{escapeHtml(ident.mcc || 'n/a')}} / MNC ${{escapeHtml(ident.mnc || 'n/a')}} / TAC ${{escapeHtml(ident.tac || 'n/a')}}<br>` +
+      `Cell ${{escapeHtml(ident.cell_id || 'n/a')}}<br>` +
+      `RF ${{escapeHtml(String((rf.quality || 'unknown')).toUpperCase())}} · ${{escapeHtml(towerRfSummary(rf))}}<br>` +
+      `Range ${{escapeHtml(tower && tower.range_m != null ? tower.range_m : 'n/a')}}m`
+    );
+
+  towerMapLineObj = L.polyline(
+    [[routerLat, routerLon], [towerLat, towerLon]],
+    {{
+      color: lineColor,
+      weight: 4,
+      opacity: 0.9,
+      dashArray: '8 7'
+    }}
+  ).addTo(towerMapObj);
+
+  const bounds = L.latLngBounds([[routerLat, routerLon], [towerLat, towerLon]]);
+  towerMapObj.fitBounds(bounds, {{padding: [38, 38], maxZoom: 16}});
+
+  window.setTimeout(() => {{
+    if (towerMapObj) towerMapObj.invalidateSize();
+  }}, 160);
 }}
 
 
@@ -16777,6 +16907,8 @@ async function loadRouter() {{
   }}
 
   routerData = data;
+  window.currentTowerHistory = towerHistory;
+  resetTowerMappingMap();
   const content = document.getElementById('content');
 
   const sims = (data.sims || []).map(s => `
