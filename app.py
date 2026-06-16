@@ -572,6 +572,293 @@ def classify_cellular_event(old_row, metric: dict) -> str:
     return "cell_identity_change"
 
 
+
+def _cellular_identity_value(value) -> str:
+    """Normalize cellular identity values for matching/storage."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def lookup_opencellid_cell(conn, mcc, mnc, tac, cell_id):
+    """Return an exact OpenCellID match for MCC/MNC/TAC/Cell ID, if imported."""
+    mcc = _cellular_identity_value(mcc)
+    mnc = _cellular_identity_value(mnc)
+    tac = _cellular_identity_value(tac)
+    cell_id = _cellular_identity_value(cell_id)
+
+    if not all((mcc, mnc, tac, cell_id)):
+        return None
+
+    return conn.execute(
+        """
+        SELECT
+            mcc,
+            mnc,
+            tac,
+            cell_id,
+            lat,
+            lon,
+            range_m,
+            samples,
+            updated
+        FROM opencellid_cells
+        WHERE mcc = ?
+          AND mnc = ?
+          AND tac = ?
+          AND cell_id = ?
+        LIMIT 1
+        """,
+        (mcc, mnc, tac, cell_id),
+    ).fetchone()
+
+
+def upsert_cellular_identity_history(conn, router_id: str, router_name: str, net_device_id: str, metric: dict, profile_id=None):
+    """
+    Maintain router-observed cellular identity history.
+
+    This is intentionally separate from cellular_events:
+    - cellular_events captures notable changes for UI/event context.
+    - cellular_identity_history captures observed tower identity over time.
+    """
+    profile_id = int(profile_id or 1)
+    router_id = str(router_id)
+    router_name = str(router_name or router_id)
+    net_device_id = str(net_device_id)
+
+    mcc = _cellular_identity_value(metric.get("mcc"))
+    mnc = _cellular_identity_value(metric.get("mnc"))
+    tac = _cellular_identity_value(metric.get("tac"))
+    cell_id = _cellular_identity_value(metric.get("cell_id"))
+
+    if not all((mcc, mnc, tac, cell_id)):
+        return {"status": "skipped", "reason": "incomplete_cell_identity"}
+
+    identity_key = cell_identity_key_from_metric(metric)
+    now = now_utc()
+    last_sample_ts = metric.get("update_ts") or now
+
+    sim_label = None
+    try:
+        sim_row = conn.execute(
+            "SELECT sim_label FROM net_devices WHERE id = ? LIMIT 1",
+            (net_device_id,),
+        ).fetchone()
+        if sim_row:
+            sim_label = sim_row["sim_label"] if isinstance(sim_row, sqlite3.Row) else sim_row[0]
+    except Exception:
+        sim_label = None
+
+    match = lookup_opencellid_cell(conn, mcc, mnc, tac, cell_id)
+    match_status = "exact" if match else "unmatched"
+
+    if match:
+        opencellid_mcc = match["mcc"]
+        opencellid_mnc = match["mnc"]
+        opencellid_tac = match["tac"]
+        opencellid_cell_id = match["cell_id"]
+        opencellid_lat = match["lat"]
+        opencellid_lon = match["lon"]
+        opencellid_range_m = match["range_m"]
+        opencellid_samples = match["samples"]
+        opencellid_updated = match["updated"]
+    else:
+        opencellid_mcc = None
+        opencellid_mnc = None
+        opencellid_tac = None
+        opencellid_cell_id = None
+        opencellid_lat = None
+        opencellid_lon = None
+        opencellid_range_m = None
+        opencellid_samples = None
+        opencellid_updated = None
+
+    # Close any previously-current identity for this modem when the identity changes.
+    conn.execute(
+        """
+        UPDATE cellular_identity_history
+        SET
+            is_current = 0,
+            closed_at = COALESCE(closed_at, ?),
+            updated_at = ?
+        WHERE net_device_id = ?
+          AND is_current = 1
+          AND COALESCE(identity_key, '') != ?
+        """,
+        (now, now, net_device_id, identity_key),
+    )
+
+    current = conn.execute(
+        """
+        SELECT id
+        FROM cellular_identity_history
+        WHERE net_device_id = ?
+          AND is_current = 1
+          AND identity_key = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (net_device_id, identity_key),
+    ).fetchone()
+
+    values = (
+        profile_id,
+        router_id,
+        router_name,
+        net_device_id,
+        sim_label,
+        mcc,
+        mnc,
+        tac,
+        cell_id,
+        identity_key,
+        metric.get("service_type"),
+        metric.get("rfband"),
+        metric.get("rfband5g"),
+        metric.get("rfchannel"),
+        metric.get("ltebandwidth"),
+        metric.get("mtu"),
+        now,
+        last_sample_ts,
+        match_status,
+        now,
+        opencellid_mcc,
+        opencellid_mnc,
+        opencellid_tac,
+        opencellid_cell_id,
+        opencellid_lat,
+        opencellid_lon,
+        opencellid_range_m,
+        opencellid_samples,
+        opencellid_updated,
+        now,
+    )
+
+    if current:
+        history_id = current["id"] if isinstance(current, sqlite3.Row) else current[0]
+        conn.execute(
+            """
+            UPDATE cellular_identity_history
+            SET
+                profile_id = ?,
+                router_id = ?,
+                router_name = ?,
+                net_device_id = ?,
+                sim_label = ?,
+                mcc = ?,
+                mnc = ?,
+                tac = ?,
+                cell_id = ?,
+                identity_key = ?,
+                service_type = ?,
+                rfband = ?,
+                rfband5g = ?,
+                rfchannel = ?,
+                ltebandwidth = ?,
+                mtu = ?,
+                last_seen_ts = ?,
+                last_sample_ts = ?,
+                sample_count = sample_count + 1,
+                is_current = 1,
+                closed_at = NULL,
+                match_status = ?,
+                match_updated_at = ?,
+                opencellid_mcc = ?,
+                opencellid_mnc = ?,
+                opencellid_tac = ?,
+                opencellid_cell_id = ?,
+                opencellid_lat = ?,
+                opencellid_lon = ?,
+                opencellid_range_m = ?,
+                opencellid_samples = ?,
+                opencellid_updated = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            values + (history_id,),
+        )
+        return {"status": "updated", "match_status": match_status, "history_id": history_id}
+
+    conn.execute(
+        """
+        INSERT INTO cellular_identity_history (
+            profile_id,
+            router_id,
+            router_name,
+            net_device_id,
+            sim_label,
+            mcc,
+            mnc,
+            tac,
+            cell_id,
+            identity_key,
+            service_type,
+            rfband,
+            rfband5g,
+            rfchannel,
+            ltebandwidth,
+            mtu,
+            first_seen_ts,
+            last_seen_ts,
+            last_sample_ts,
+            sample_count,
+            is_current,
+            match_status,
+            match_updated_at,
+            opencellid_mcc,
+            opencellid_mnc,
+            opencellid_tac,
+            opencellid_cell_id,
+            opencellid_lat,
+            opencellid_lon,
+            opencellid_range_m,
+            opencellid_samples,
+            opencellid_updated,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            profile_id,
+            router_id,
+            router_name,
+            net_device_id,
+            sim_label,
+            mcc,
+            mnc,
+            tac,
+            cell_id,
+            identity_key,
+            metric.get("service_type"),
+            metric.get("rfband"),
+            metric.get("rfband5g"),
+            metric.get("rfchannel"),
+            metric.get("ltebandwidth"),
+            metric.get("mtu"),
+            now,
+            now,
+            last_sample_ts,
+            match_status,
+            now,
+            opencellid_mcc,
+            opencellid_mnc,
+            opencellid_tac,
+            opencellid_cell_id,
+            opencellid_lat,
+            opencellid_lon,
+            opencellid_range_m,
+            opencellid_samples,
+            opencellid_updated,
+            now,
+            now,
+        ),
+    )
+
+    return {"status": "inserted", "match_status": match_status}
+
+
+
 def record_cellular_metric_event(conn, router_id: str, net_device_id: str, metric: dict, profile_id=None):
     """
     Records first_seen and cellular identity changes for a modem net device.
@@ -617,6 +904,18 @@ def record_cellular_metric_event(conn, router_id: str, net_device_id: str, metri
     ).fetchone()
 
     router_name = router_id
+
+    try:
+        upsert_cellular_identity_history(
+            conn,
+            router_id=router_id,
+            router_name=router_name,
+            net_device_id=net_device_id,
+            metric=metric,
+            profile_id=profile_id,
+        )
+    except Exception as exc:
+        print(f"[cellular-identity-history] Failed updating history router={router_id} net_device={net_device_id}: {exc}")
 
     if old is None:
         conn.execute(
