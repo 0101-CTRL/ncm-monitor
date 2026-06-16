@@ -870,7 +870,10 @@ def record_cellular_metric_event(conn, router_id: str, net_device_id: str, metri
     if not CELLULAR_MONITOR_ENABLED:
         return {"status": "disabled"}
 
-    profile_id = 1
+    try:
+        profile_id = int(profile_id or 1)
+    except Exception:
+        profile_id = 1
     ensure_cellular_monitor_tables(profile_id)
     router_id = str(router_id)
     net_device_id = str(net_device_id)
