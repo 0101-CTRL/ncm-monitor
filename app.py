@@ -14676,7 +14676,29 @@ function renderSignalChart(rows, cellularEvents, selectedDays, startDate, endDat
     }};
   }}
 
-  const eventPoints = cellChangeEvents.map(cellularEventPoint).filter(p => p.x && labelSet.has(p.x));
+  const cellChangeByDay = new Map();
+  cellChangeEvents.forEach(e => {{
+    const p = cellularEventPoint(e);
+    if (!p.x || !labelSet.has(p.x)) return;
+    if (!cellChangeByDay.has(p.x)) cellChangeByDay.set(p.x, []);
+    cellChangeByDay.get(p.x).push(p);
+  }});
+
+  const eventPoints = Array.from(cellChangeByDay.entries()).map(([day, points]) => {{
+    points.sort((a, b) => new Date(a.detected_at || 0) - new Date(b.detected_at || 0));
+    const latest = points[points.length - 1] || {{}};
+    const first = points[0] || latest;
+
+    return {{
+      ...latest,
+      x: day,
+      y: latest.y,
+      event_count: points.length,
+      first_detected: first.detected_at,
+      last_detected: latest.detected_at,
+      grouped_event_types: [...new Set(points.map(p => p.event_type).filter(Boolean))]
+    }};
+  }});
 
   const serviceModeByDay = new Map();
   serviceModeEvents.forEach(e => {{
@@ -14764,7 +14786,11 @@ function renderSignalChart(rows, cellularEvents, selectedDays, startDate, endDat
         const raw = (ds.data || [])[point.index];
 
         if ((ds.label === 'Cell/tower change' || ds.label === '5G service mode change') && raw && raw.detected_at) {{
-          openEventContextPanel(ds.label || 'Cellular event', raw.detected_at);
+          if (raw.event_count && Number(raw.event_count) > 1 && raw.x) {{
+            openEventContextPanel(ds.label || 'Cellular event', chartDayAnchorUtc(raw.x), 720, 720, 'daily');
+          }} else {{
+            openEventContextPanel(ds.label || 'Cellular event', raw.detected_at);
+          }}
           return;
         }}
 
@@ -14784,13 +14810,22 @@ function renderSignalChart(rows, cellularEvents, selectedDays, startDate, endDat
               const raw = ctx.raw || {{}};
 
               if (ctx.dataset && ctx.dataset.label === 'Cell/tower change') {{
-                return [
-                  'Cell/tower change: ' + (raw.event_type || 'change'),
-                  'Detected: ' + formatCellularTime(raw.detected_at),
-                  'Old: TAC ' + (raw.old_tac || 'n/a') + ' / Cell ' + shortCell(raw.old_cell_id),
-                  'New: TAC ' + (raw.new_tac || 'n/a') + ' / Cell ' + shortCell(raw.new_cell_id),
-                  'Signal: RSRP ' + (raw.rsrp ?? 'n/a') + ' / RSRQ ' + (raw.rsrq ?? 'n/a') + ' / SINR ' + (raw.sinr ?? 'n/a')
+                const count = Number(raw.event_count || 1);
+                const typeList = Array.isArray(raw.grouped_event_types) && raw.grouped_event_types.length
+                  ? raw.grouped_event_types.join(', ')
+                  : (raw.event_type || 'change');
+
+                const lines = [
+                  count > 1 ? `Cell/tower changes: ${{count}} events` : 'Cell/tower change: ' + (raw.event_type || 'change'),
+                  count > 1 ? 'Event types: ' + typeList : null,
+                  'First: ' + formatCellularTime(raw.first_detected || raw.detected_at),
+                  count > 1 ? 'Last: ' + formatCellularTime(raw.last_detected || raw.detected_at) : null,
+                  'Latest old: TAC ' + (raw.old_tac || 'n/a') + ' / Cell ' + shortCell(raw.old_cell_id),
+                  'Latest new: TAC ' + (raw.new_tac || 'n/a') + ' / Cell ' + shortCell(raw.new_cell_id),
+                  'Latest signal: RSRP ' + (raw.rsrp ?? 'n/a') + ' / RSRQ ' + (raw.rsrq ?? 'n/a') + ' / SINR ' + (raw.sinr ?? 'n/a')
                 ];
+
+                return lines.filter(Boolean);
               }}
 
               if (ctx.dataset && ctx.dataset.label === '5G service mode change') {{
