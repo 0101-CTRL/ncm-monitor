@@ -588,6 +588,143 @@ def _cellular_identity_value(value) -> str:
     return value
 
 
+def _cellular_metric_float(metric: dict, key: str):
+    value = metric.get(key)
+    if value is None:
+        return None
+
+    value = str(value).strip()
+    if not value:
+        return None
+
+    value = value.replace("%", "").strip()
+
+    # Keep the first numeric token if NCM ever includes unit text.
+    value = value.split()[0]
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _row_value(row, key):
+    try:
+        return row[key]
+    except Exception:
+        try:
+            return row.get(key)
+        except Exception:
+            return None
+
+
+def _identity_stat_update(row, prefix: str, value):
+    count_key = f"{prefix}_sample_count"
+    min_key = f"min_{prefix}"
+    max_key = f"max_{prefix}"
+    avg_key = f"avg_{prefix}"
+
+    old_count = int(_row_value(row, count_key) or 0)
+    old_min = _row_value(row, min_key)
+    old_max = _row_value(row, max_key)
+    old_avg = _row_value(row, avg_key)
+
+    new_count = old_count + 1
+    new_min = value if old_min is None else min(float(old_min), value)
+    new_max = value if old_max is None else max(float(old_max), value)
+
+    if old_avg is None:
+        new_avg = value
+    else:
+        new_avg = ((float(old_avg) * old_count) + value) / new_count
+
+    return new_min, new_max, new_avg, new_count
+
+
+def update_cellular_identity_history_signal_stats(conn, router_id: str, net_device_id: str, metric: dict, profile_id=None):
+    """Update RF quality aggregates for the current cellular identity history row."""
+    try:
+        profile_id = int(profile_id or 1)
+    except Exception:
+        profile_id = 1
+
+    router_id = str(router_id)
+    net_device_id = str(net_device_id)
+
+    mcc = _cellular_identity_value(metric.get("mcc"))
+    mnc = _cellular_identity_value(metric.get("mnc"))
+    tac = _cellular_identity_value(metric.get("tac"))
+    cell_id = _cellular_identity_value(metric.get("cell_id"))
+
+    if not all((mcc, mnc, tac, cell_id)):
+        return {"status": "skipped", "reason": "incomplete_cell_identity"}
+
+    identity_key = f"{mcc}|{mnc}|{tac}|{cell_id}"
+
+    row = conn.execute("""
+        SELECT *
+        FROM cellular_identity_history
+        WHERE profile_id = ?
+          AND router_id = ?
+          AND net_device_id = ?
+          AND identity_key = ?
+          AND is_current = 1
+        ORDER BY id DESC
+        LIMIT 1
+    """, (profile_id, router_id, net_device_id, identity_key)).fetchone()
+
+    if not row:
+        return {"status": "skipped", "reason": "no_current_identity_history_row"}
+
+    metric_map = {
+        "dbm": "dbm",
+        "rsrp": "rsrp",
+        "rsrq": "rsrq",
+        "sinr": "sinr",
+        "signal_strength": "signal_strength",
+    }
+
+    updates = []
+    params = []
+
+    for metric_key, prefix in metric_map.items():
+        value = _cellular_metric_float(metric, metric_key)
+        if value is None:
+            continue
+
+        new_min, new_max, new_avg, new_count = _identity_stat_update(row, prefix, value)
+
+        updates.extend([
+            f"last_{prefix} = ?",
+            f"min_{prefix} = ?",
+            f"max_{prefix} = ?",
+            f"avg_{prefix} = ?",
+            f"{prefix}_sample_count = ?",
+        ])
+        params.extend([value, new_min, new_max, new_avg, new_count])
+
+    if not updates:
+        return {"status": "skipped", "reason": "no_rf_values"}
+
+    updates.append("updated_at = ?")
+    params.append(now_utc())
+    params.append(row["id"])
+
+    conn.execute(f"""
+        UPDATE cellular_identity_history
+        SET {", ".join(updates)}
+        WHERE id = ?
+    """, params)
+
+    return {
+        "status": "updated",
+        "identity_history_id": row["id"],
+        "identity_key": identity_key,
+        "fields_updated": len(updates) - 1,
+    }
+
+
+
 def lookup_opencellid_cell(conn, mcc, mnc, tac, cell_id):
     """Return an exact OpenCellID match for MCC/MNC/TAC/Cell ID, if imported."""
     mcc = _cellular_identity_value(mcc)
@@ -923,6 +1060,13 @@ def record_cellular_metric_event(conn, router_id: str, net_device_id: str, metri
             conn,
             router_id=router_id,
             router_name=router_name,
+            net_device_id=net_device_id,
+            metric=metric,
+            profile_id=profile_id,
+        )
+        update_cellular_identity_history_signal_stats(
+            conn,
+            router_id=router_id,
             net_device_id=net_device_id,
             metric=metric,
             profile_id=profile_id,
@@ -1604,6 +1748,47 @@ def ensure_cellular_monitor_tables(profile_id=None):
             ON cellular_identity_history(mcc, mnc, tac, cell_id)
         """)
 
+        # v5.1.0 RF quality aggregates for tower-history analysis.
+        cellular_identity_history_rf_columns = {
+            "last_dbm": "REAL",
+            "min_dbm": "REAL",
+            "max_dbm": "REAL",
+            "avg_dbm": "REAL",
+            "dbm_sample_count": "INTEGER DEFAULT 0",
+
+            "last_rsrp": "REAL",
+            "min_rsrp": "REAL",
+            "max_rsrp": "REAL",
+            "avg_rsrp": "REAL",
+            "rsrp_sample_count": "INTEGER DEFAULT 0",
+
+            "last_rsrq": "REAL",
+            "min_rsrq": "REAL",
+            "max_rsrq": "REAL",
+            "avg_rsrq": "REAL",
+            "rsrq_sample_count": "INTEGER DEFAULT 0",
+
+            "last_sinr": "REAL",
+            "min_sinr": "REAL",
+            "max_sinr": "REAL",
+            "avg_sinr": "REAL",
+            "sinr_sample_count": "INTEGER DEFAULT 0",
+
+            "last_signal_strength": "REAL",
+            "min_signal_strength": "REAL",
+            "max_signal_strength": "REAL",
+            "avg_signal_strength": "REAL",
+            "signal_strength_sample_count": "INTEGER DEFAULT 0",
+        }
+
+        for col_name, col_type in cellular_identity_history_rf_columns.items():
+            try:
+                conn.execute(f"ALTER TABLE cellular_identity_history ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+
+
         for table_name in ("net_device_metrics", "cellular_current_state"):
             for col_name, col_type in (
                 ("rfband", "TEXT"),
@@ -2104,6 +2289,395 @@ async def api_opencellid_import(
             ))
             conn.commit()
             raise HTTPException(status_code=500, detail=f"OpenCellID import failed: {exc}")
+
+
+
+
+
+@app.get("/opencellid-admin", response_class=HTMLResponse)
+async def opencellid_admin_page():
+    return HTMLResponse("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>OpenCellID Admin</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Inter, Arial, sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 22px;
+    }
+    .title {
+      font-size: 28px;
+      font-weight: 900;
+      margin: 0;
+    }
+    .sub {
+      color: #94a3b8;
+      margin-top: 6px;
+      line-height: 1.45;
+    }
+    a {
+      color: #93c5fd;
+      text-decoration: none;
+      font-weight: 700;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+    .card {
+      background: rgba(15, 23, 42, .92);
+      border: 1px solid rgba(148, 163, 184, .25);
+      border-radius: 18px;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, .28);
+      padding: 18px;
+    }
+    .metric-label {
+      color: #94a3b8;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      font-weight: 800;
+    }
+    .metric-value {
+      font-size: 30px;
+      font-weight: 900;
+      margin-top: 8px;
+    }
+    .section-title {
+      font-size: 18px;
+      font-weight: 900;
+      margin: 0 0 12px;
+    }
+    .row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin: 10px 0;
+    }
+    input[type="file"] {
+      background: #111827;
+      border: 1px solid rgba(148, 163, 184, .35);
+      color: #e5e7eb;
+      border-radius: 12px;
+      padding: 10px;
+      min-width: 360px;
+    }
+    label {
+      color: #cbd5e1;
+      font-weight: 700;
+    }
+    button {
+      border: 0;
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      color: white;
+      border-radius: 12px;
+      padding: 11px 15px;
+      font-weight: 900;
+      cursor: pointer;
+      box-shadow: 0 12px 28px rgba(37, 99, 235, .28);
+    }
+    button:disabled {
+      opacity: .55;
+      cursor: wait;
+    }
+    .danger {
+      background: linear-gradient(135deg, #dc2626, #991b1b);
+    }
+    .muted {
+      color: #94a3b8;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .warn {
+      background: rgba(245, 158, 11, .12);
+      border: 1px solid rgba(245, 158, 11, .35);
+      color: #fde68a;
+      border-radius: 14px;
+      padding: 12px 14px;
+      margin-top: 12px;
+      line-height: 1.45;
+    }
+    .ok {
+      background: rgba(34, 197, 94, .12);
+      border: 1px solid rgba(34, 197, 94, .35);
+      color: #bbf7d0;
+      border-radius: 14px;
+      padding: 12px 14px;
+      margin-top: 12px;
+      line-height: 1.45;
+    }
+    .err {
+      background: rgba(239, 68, 68, .12);
+      border: 1px solid rgba(239, 68, 68, .35);
+      color: #fecaca;
+      border-radius: 14px;
+      padding: 12px 14px;
+      margin-top: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      overflow: hidden;
+      border-radius: 14px;
+    }
+    th, td {
+      border-bottom: 1px solid rgba(148, 163, 184, .18);
+      text-align: left;
+      padding: 10px;
+      font-size: 13px;
+    }
+    th {
+      color: #cbd5e1;
+      background: rgba(30, 41, 59, .72);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      font-size: 11px;
+    }
+    td {
+      color: #e5e7eb;
+    }
+    pre {
+      background: #020617;
+      border: 1px solid rgba(148, 163, 184, .22);
+      border-radius: 14px;
+      padding: 12px;
+      overflow: auto;
+      max-height: 360px;
+      color: #c4b5fd;
+    }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+      input[type="file"] { min-width: 0; width: 100%; }
+      .topbar { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <h1 class="title">OpenCellID Admin</h1>
+        <div class="sub">
+          Import OpenCellID CSV data and refresh exact matches for cellular identity history.
+        </div>
+      </div>
+      <div class="row">
+        <a href="/launcher">Launcher</a>
+        <a href="/ui">Dashboard</a>
+        <a href="/monitoring-targets-ui">Router Overview</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="metric-label">Imported Cells</div>
+        <div class="metric-value" id="cellTotal">...</div>
+        <div class="muted"><span id="networkTotal">...</span> networks, <span id="areaTotal">...</span> areas</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Identity History Rows</div>
+        <div class="metric-value" id="historyRows">...</div>
+        <div class="muted">Current and closed cellular identities</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Exact Matches</div>
+        <div class="metric-value" id="exactMatches">...</div>
+        <div class="muted"><span id="unmatchedTotal">...</span> unmatched</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="section-title">Import OpenCellID CSV</h2>
+      <div class="muted">
+        Use the CSV file from the OpenCellID dataset download. Large imports may take a while. Leave this page open until the import completes.
+      </div>
+
+      <div class="warn">
+        Recommended for full USA datasets: import one CSV at a time. The backend now streams uploads through temporary files, but browser uploads can still take time depending on file size and server resources.
+      </div>
+
+      <form id="importForm">
+        <div class="row">
+          <input id="csvFile" name="file" type="file" accept=".csv,text/csv" required>
+        </div>
+
+        <div class="row">
+          <label>
+            <input id="replaceExisting" type="checkbox">
+            Replace existing OpenCellID cells before import
+          </label>
+        </div>
+
+        <div class="row">
+          <label>
+            <input id="rematchHistory" type="checkbox" checked>
+            Rematch cellular identity history after import
+          </label>
+        </div>
+
+        <div class="row">
+          <button id="importBtn" type="submit">Import CSV</button>
+          <button type="button" onclick="loadStatus()">Refresh Status</button>
+        </div>
+      </form>
+
+      <div id="importMessage"></div>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <h2 class="section-title">Latest Import</h2>
+      <div id="latestImport"></div>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <h2 class="section-title">Raw Status</h2>
+      <pre id="rawStatus">Loading...</pre>
+    </div>
+  </div>
+
+<script>
+function fmt(value) {
+  if (value === null || value === undefined) return "0";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  return n.toLocaleString();
+}
+
+function latestImportHtml(latest) {
+  if (!latest) {
+    return '<div class="muted">No imports recorded yet.</div>';
+  }
+
+  return `
+    <table>
+      <tr><th>ID</th><td>${latest.id ?? ''}</td></tr>
+      <tr><th>Source File</th><td>${latest.source_file ?? ''}</td></tr>
+      <tr><th>Imported At</th><td>${latest.imported_at ?? ''}</td></tr>
+      <tr><th>Rows Seen</th><td>${fmt(latest.rows_seen)}</td></tr>
+      <tr><th>Inserted</th><td>${fmt(latest.rows_inserted)}</td></tr>
+      <tr><th>Updated</th><td>${fmt(latest.rows_updated)}</td></tr>
+      <tr><th>Skipped</th><td>${fmt(latest.rows_skipped)}</td></tr>
+      <tr><th>Status</th><td>${latest.status ?? ''}</td></tr>
+      <tr><th>Notes</th><td>${latest.notes ?? ''}</td></tr>
+    </table>
+  `;
+}
+
+async function loadStatus() {
+  const raw = document.getElementById('rawStatus');
+  raw.textContent = 'Loading...';
+
+  try {
+    const res = await fetch('/api/opencellid/status', { credentials: 'same-origin' });
+    const text = await res.text();
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+
+    const data = JSON.parse(text);
+
+    document.getElementById('cellTotal').textContent = fmt(data.cells?.total);
+    document.getElementById('networkTotal').textContent = fmt(data.cells?.networks);
+    document.getElementById('areaTotal').textContent = fmt(data.cells?.areas);
+    document.getElementById('historyRows').textContent = fmt(data.history?.rows);
+    document.getElementById('exactMatches').textContent = fmt(data.history?.exact_matches);
+    document.getElementById('unmatchedTotal').textContent = fmt(data.history?.unmatched);
+    document.getElementById('latestImport').innerHTML = latestImportHtml(data.latest_import);
+
+    raw.textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    raw.textContent = String(err);
+    document.getElementById('latestImport').innerHTML = `<div class="err">${String(err)}</div>`;
+  }
+}
+
+document.getElementById('importForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+
+  const fileInput = document.getElementById('csvFile');
+  const btn = document.getElementById('importBtn');
+  const msg = document.getElementById('importMessage');
+
+  if (!fileInput.files || fileInput.files.length === 0) {
+    msg.innerHTML = '<div class="err">Choose a CSV file first.</div>';
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  fd.append('replace_existing', document.getElementById('replaceExisting').checked ? 'true' : 'false');
+  fd.append('rematch_history', document.getElementById('rematchHistory').checked ? 'true' : 'false');
+
+  btn.disabled = true;
+  btn.textContent = 'Importing...';
+  msg.innerHTML = '<div class="warn">Import running. Leave this page open. Large datasets can take a while.</div>';
+
+  try {
+    const res = await fetch('/api/opencellid/import', {
+      method: 'POST',
+      body: fd,
+      credentials: 'same-origin'
+    });
+
+    const text = await res.text();
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+
+    const data = JSON.parse(text);
+    const result = data.import_result || {};
+
+    msg.innerHTML = `
+      <div class="ok">
+        Import complete.<br>
+        Rows seen: ${fmt(result.rows_seen)}<br>
+        Inserted: ${fmt(result.rows_inserted)}<br>
+        Updated: ${fmt(result.rows_updated)}<br>
+        Skipped: ${fmt(result.rows_skipped)}
+      </div>
+    `;
+
+    await loadStatus();
+  } catch (err) {
+    msg.innerHTML = `<div class="err">${String(err)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Import CSV';
+  }
+});
+
+loadStatus();
+</script>
+</body>
+</html>
+    """)
 
 
 
