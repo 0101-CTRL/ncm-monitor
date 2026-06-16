@@ -641,7 +641,7 @@ def upsert_cellular_identity_history(conn, router_id: str, router_name: str, net
     if not all((mcc, mnc, tac, cell_id)):
         return {"status": "skipped", "reason": "incomplete_cell_identity"}
 
-    identity_key = cell_identity_key_from_metric(metric)
+    identity_key = f"{mcc}|{mnc}|{tac}|{cell_id}"
     now = now_utc()
     last_sample_ts = metric.get("update_ts") or now
 
