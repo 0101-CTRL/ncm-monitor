@@ -2020,6 +2020,249 @@ def _tower_iso(value):
     return str(value)
 
 
+
+def _tower_dt(value):
+    return parse_dt(value)
+
+
+def _tower_duration_label(seconds):
+    try:
+        total = max(0, int(seconds or 0))
+    except Exception:
+        total = 0
+
+    days = total // 86400
+    hours = (total % 86400) // 3600
+    minutes = (total % 3600) // 60
+
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return "<1m"
+
+
+def _tower_segment_start_dt(item):
+    window = item.get("window") or {}
+    return _tower_dt(window.get("first_seen_ts")) or _tower_dt(window.get("last_seen_ts"))
+
+
+def _tower_segment_end_dt(item, until_dt):
+    window = item.get("window") or {}
+    if window.get("is_current"):
+        return until_dt
+    return (
+        _tower_dt(window.get("closed_at"))
+        or _tower_dt(window.get("last_seen_ts"))
+        or _tower_dt(window.get("first_seen_ts"))
+        or until_dt
+    )
+
+
+def _tower_stability_from_handoffs(handoffs, hours):
+    try:
+        handoffs = int(handoffs or 0)
+    except Exception:
+        handoffs = 0
+    try:
+        hours = max(float(hours or 0), 1.0)
+    except Exception:
+        hours = 1.0
+
+    handoffs_per_24h = handoffs * 24.0 / hours
+
+    if handoffs_per_24h <= 1:
+        key = "stable"
+        label = "Stable"
+        description = "Little to no tower hopping observed in this window."
+    elif handoffs_per_24h <= 4:
+        key = "light_hopping"
+        label = "Light hopping"
+        description = "Occasional serving-cell changes observed."
+    elif handoffs_per_24h <= 12:
+        key = "moderate_hopping"
+        label = "Moderate hopping"
+        description = "Frequent tower changes observed. Worth comparing against signal, reconnects, and offline events."
+    else:
+        key = "heavy_hopping"
+        label = "Heavy hopping"
+        description = "Aggressive tower changes observed. This may indicate weak RF, mobility, or unstable carrier selection."
+
+    return {
+        "key": key,
+        "label": label,
+        "description": description,
+        "handoffs_per_24h": round(handoffs_per_24h, 2),
+    }
+
+
+def build_tower_handoff_analysis(history, since_dt, until_dt, hours):
+    """
+    Analyze tower stability using observed cellular identity windows.
+
+    This is not continuous movement tracking. It is derived from recorded serving-cell
+    identity windows, with connected interfaces preferred when available.
+    """
+    history = history or []
+    since_dt = since_dt or (until_dt - timedelta(hours=hours))
+    until_dt = until_dt or datetime.now(timezone.utc)
+
+    # Annotate every returned segment with duration metadata for the UI.
+    all_chronological = sorted(
+        history,
+        key=lambda item: (
+            _tower_segment_start_dt(item) or since_dt,
+            _tower_segment_end_dt(item, until_dt) or until_dt,
+            item.get("id") or 0,
+        )
+    )
+
+    for idx, item in enumerate(all_chronological, 1):
+        start = _tower_segment_start_dt(item) or since_dt
+        end = _tower_segment_end_dt(item, until_dt) or until_dt
+        visible_start = max(start, since_dt)
+        visible_end = min(end, until_dt)
+        duration_seconds = max(0, int((visible_end - visible_start).total_seconds()))
+
+        item["analysis"] = {
+            "sequence": idx,
+            "duration_seconds": duration_seconds,
+            "duration_label": _tower_duration_label(duration_seconds),
+            "visible_start_ts": visible_start.isoformat(),
+            "visible_end_ts": visible_end.isoformat(),
+            "handoff_from_previous": False,
+            "previous_tower_key": None,
+        }
+
+    connected = [
+        item for item in all_chronological
+        if str(((item.get("interface") or {}).get("connection_state") or "")).lower() == "connected"
+    ]
+    analysis_source = connected if connected else all_chronological
+
+    timeline = []
+    handoff_events = []
+    observed_seconds_by_tower = {}
+    previous = None
+    previous_key = None
+
+    for item in analysis_source:
+        ident = item.get("identity") or {}
+        window = item.get("window") or {}
+        rf = item.get("rf") or {}
+        radio = item.get("radio") or {}
+        iface = item.get("interface") or {}
+
+        key = ident.get("tower_key") or ident.get("identity_key")
+        if not key:
+            continue
+
+        start = _tower_segment_start_dt(item) or since_dt
+        end = _tower_segment_end_dt(item, until_dt) or until_dt
+        visible_start = max(start, since_dt)
+        visible_end = min(end, until_dt)
+        duration_seconds = max(0, int((visible_end - visible_start).total_seconds()))
+
+        observed_seconds_by_tower[key] = observed_seconds_by_tower.get(key, 0) + duration_seconds
+
+        handoff_from_previous = bool(previous_key and previous_key != key)
+        if item.get("analysis") is not None:
+            item["analysis"]["handoff_from_previous"] = handoff_from_previous
+            item["analysis"]["previous_tower_key"] = previous_key if handoff_from_previous else None
+
+        entry = {
+            "sequence": len(timeline) + 1,
+            "tower_key": key,
+            "sim_label": item.get("sim_label"),
+            "net_device_id": item.get("net_device_id"),
+            "connection_state": iface.get("connection_state"),
+            "carrier": iface.get("carrier"),
+            "service_type": radio.get("service_type"),
+            "rfband": radio.get("rfband"),
+            "rfchannel": radio.get("rfchannel"),
+            "match_status": (item.get("match") or {}).get("status"),
+            "tower_found": bool((item.get("tower") or {}).get("found")),
+            "first_seen_ts": window.get("first_seen_ts"),
+            "last_seen_ts": window.get("last_seen_ts"),
+            "closed_at": window.get("closed_at"),
+            "is_current": bool(window.get("is_current")),
+            "duration_seconds": duration_seconds,
+            "duration_label": _tower_duration_label(duration_seconds),
+            "rf_quality": rf.get("quality"),
+            "rf_basis": rf.get("basis"),
+            "rf_value": rf.get("value"),
+            "rsrp": ((rf.get("last") or {}).get("rsrp")),
+            "rsrq": ((rf.get("last") or {}).get("rsrq")),
+            "sinr": ((rf.get("last") or {}).get("sinr")),
+            "dbm": ((rf.get("last") or {}).get("dbm")),
+            "handoff_from_previous": handoff_from_previous,
+            "previous_tower_key": previous_key if handoff_from_previous else None,
+        }
+        timeline.append(entry)
+
+        if handoff_from_previous:
+            handoff_events.append({
+                "detected_at": entry["first_seen_ts"],
+                "from_tower_key": previous_key,
+                "to_tower_key": key,
+                "to_sim_label": item.get("sim_label"),
+                "to_rf_quality": rf.get("quality"),
+                "to_rf_basis": rf.get("basis"),
+                "to_rf_value": rf.get("value"),
+            })
+
+        previous = item
+        previous_key = key
+
+    handoff_count = len(handoff_events)
+    unique_tower_count = len(observed_seconds_by_tower)
+    durations = [entry["duration_seconds"] for entry in timeline if entry.get("duration_seconds") is not None]
+
+    current_items = [
+        item for item in analysis_source
+        if bool((item.get("window") or {}).get("is_current"))
+    ]
+    current_item = current_items[-1] if current_items else None
+    current_dwell_seconds = None
+    if current_item:
+        start = _tower_segment_start_dt(current_item)
+        if start:
+            current_dwell_seconds = max(0, int((until_dt - start).total_seconds()))
+
+    most_used_tower_key = None
+    most_used_observed_seconds = 0
+    if observed_seconds_by_tower:
+        most_used_tower_key, most_used_observed_seconds = max(
+            observed_seconds_by_tower.items(),
+            key=lambda kv: kv[1]
+        )
+
+    stability = _tower_stability_from_handoffs(handoff_count, hours)
+
+    return {
+        "source": "connected_interfaces" if connected else "all_interfaces",
+        "handoffs": handoff_count,
+        "unique_towers": unique_tower_count,
+        "stability": stability,
+        "current_dwell_seconds": current_dwell_seconds,
+        "current_dwell_label": _tower_duration_label(current_dwell_seconds) if current_dwell_seconds is not None else None,
+        "avg_dwell_seconds": round(sum(durations) / len(durations), 1) if durations else None,
+        "avg_dwell_label": _tower_duration_label(sum(durations) / len(durations)) if durations else None,
+        "shortest_dwell_seconds": min(durations) if durations else None,
+        "shortest_dwell_label": _tower_duration_label(min(durations)) if durations else None,
+        "longest_dwell_seconds": max(durations) if durations else None,
+        "longest_dwell_label": _tower_duration_label(max(durations)) if durations else None,
+        "most_used_tower_key": most_used_tower_key,
+        "most_used_observed_seconds": most_used_observed_seconds,
+        "most_used_observed_label": _tower_duration_label(most_used_observed_seconds),
+        "observed_seconds_by_tower": observed_seconds_by_tower,
+        "timeline": timeline,
+        "handoff_events": handoff_events,
+    }
+
+
 def classify_tower_rf_quality(row):
     """
     RF quality for tower mapping.
@@ -2394,6 +2637,7 @@ async def api_router_tower_history(
     history = [_tower_history_row_to_segment(row, router_location) for row in rows]
     current_segments = [item for item in history if item["window"]["is_current"]]
     current = current_segments[0] if current_segments else None
+    analysis = build_tower_handoff_analysis(history, since_utc, now_utc, hours)
 
     quality_counts = {
         "excellent": 0,
@@ -2432,6 +2676,7 @@ async def api_router_tower_history(
         "current": current,
         "current_segments": current_segments,
         "history": history,
+        "analysis": analysis,
         "summary": {
             "segments": len(history),
             "current_segments": len(current_segments),
