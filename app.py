@@ -6857,7 +6857,7 @@ async def monitoring_targets_ui(request: Request):
     <div class="row">
       <div>
         <label>Router ID</label>
-        <input id="routerId" placeholder="Example: 5083650">
+        <input id="routerId" placeholder="Example: router ID">
       </div>
       <div>
         <label>Display name optional</label>
