@@ -7,6 +7,7 @@ import sqlite3
 import asyncio
 import csv
 import io
+import tempfile
 from datetime import datetime, timezone, timedelta
 try:
     from zoneinfo import ZoneInfo
@@ -1674,6 +1675,20 @@ def _opencellid_float(value):
         return None
 
 
+def _cleanup_opencellid_temp_file(text_stream=None, tmp_path=None):
+    try:
+        if text_stream is not None:
+            text_stream.close()
+    except Exception:
+        pass
+
+    try:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    except Exception:
+        pass
+
+
 def _opencellid_import_summary(conn):
     latest = conn.execute("""
         SELECT *
@@ -1861,16 +1876,28 @@ async def api_opencellid_import(
         rows_updated = 0
         rows_skipped = 0
         rematch_result = None
+        text_stream = None
+        tmp_path = None
+        uploaded_bytes = 0
 
         try:
             if replace_existing_bool:
                 conn.execute("DELETE FROM opencellid_cells")
 
-            raw = await file.read()
-            if not raw:
+            with tempfile.NamedTemporaryFile(mode="wb", delete=False, prefix="opencellid-", suffix=".csv") as tmp:
+                tmp_path = tmp.name
+
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    uploaded_bytes += len(chunk)
+                    tmp.write(chunk)
+
+            if uploaded_bytes <= 0:
                 raise HTTPException(status_code=400, detail="CSV file is empty.")
 
-            text_stream = io.StringIO(raw.decode("utf-8-sig", errors="replace"), newline="")
+            text_stream = open(tmp_path, "r", encoding="utf-8-sig", errors="replace", newline="")
             reader = csv.DictReader(text_stream)
 
             if not reader.fieldnames:
@@ -1989,6 +2016,10 @@ async def api_opencellid_import(
                     ))
                     conn.commit()
 
+            _cleanup_opencellid_temp_file(text_stream, tmp_path)
+            text_stream = None
+            tmp_path = None
+
             if rematch_history_bool:
                 rematch_result = refresh_cellular_identity_history_matches(conn)
 
@@ -2028,6 +2059,8 @@ async def api_opencellid_import(
             return summary
 
         except HTTPException:
+            _cleanup_opencellid_temp_file(text_stream, tmp_path)
+
             conn.execute("""
                 UPDATE opencellid_imports
                 SET
@@ -2049,6 +2082,8 @@ async def api_opencellid_import(
             conn.commit()
             raise
         except Exception as exc:
+            _cleanup_opencellid_temp_file(text_stream, tmp_path)
+
             conn.execute("""
                 UPDATE opencellid_imports
                 SET
