@@ -2169,6 +2169,10 @@ def _tower_history_row_to_segment(row, router_location=None):
             "ltebandwidth": row.get("ltebandwidth"),
             "mtu": row.get("mtu"),
         },
+        "interface": {
+            "connection_state": row.get("nd_connection_state"),
+            "carrier": row.get("nd_carrier"),
+        },
         "window": {
             "first_seen_ts": _tower_iso(row.get("first_seen_ts")),
             "last_seen_ts": _tower_iso(row.get("last_seen_ts")),
@@ -2233,11 +2237,88 @@ def _tower_history_row_to_segment(row, router_location=None):
     }
 
 
+
+async def refresh_router_location_cache_for_tower_map(router_id: str, profile_id=None):
+    """
+    Pull the latest router location from NCM and cache it in the local locations table.
+
+    This is intentionally opt-in from the tower-history API so normal summary loads
+    do not create extra NCM API traffic.
+    """
+    router_id = str(router_id or "").strip()
+    if not router_id:
+        return {"ok": False, "found": False, "error": "router_id is required"}
+
+    try:
+        payload = await ncm_get(
+            "/api/v2/locations/",
+            {"router": router_id, "limit": 1},
+            profile_id=profile_id,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "found": False,
+            "error": f"Location lookup failed: {exc}",
+        }
+
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    if not rows:
+        return {
+            "ok": True,
+            "found": False,
+            "message": "NCM did not return a location for this router.",
+        }
+
+    loc = rows[0] or {}
+    lat = _tower_float(loc.get("latitude"))
+    lon = _tower_float(loc.get("longitude"))
+
+    if lat is None or lon is None:
+        return {
+            "ok": True,
+            "found": False,
+            "message": "NCM returned a location record without latitude/longitude.",
+            "raw": loc,
+        }
+
+    updated_at = loc.get("updated_at") or loc.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    accuracy = _tower_float(loc.get("accuracy"))
+    method = loc.get("method") or loc.get("source") or ""
+
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO locations (router_id, latitude, longitude, accuracy, method, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(router_id) DO UPDATE SET
+                latitude = excluded.latitude,
+                longitude = excluded.longitude,
+                accuracy = excluded.accuracy,
+                method = excluded.method,
+                updated_at = excluded.updated_at
+        """, (router_id, lat, lon, accuracy, method, updated_at))
+        conn.commit()
+
+    return {
+        "ok": True,
+        "found": True,
+        "router_id": router_id,
+        "lat": lat,
+        "lon": lon,
+        "accuracy": accuracy,
+        "method": method,
+        "updated_at": updated_at,
+        "updated_at_local": to_local_string(updated_at),
+        "source": "ncm_locations_api",
+    }
+
+
 @app.get("/api/router/{router_id}/tower-history")
 async def api_router_tower_history(
     router_id: str,
     profile_id: int = Query(1),
     hours: int = Query(168, ge=1, le=2160),
+    refresh_location: bool = Query(False),
 ):
     profile_id = normalize_profile_id(profile_id)
     router_id = str(router_id).strip()
@@ -2247,6 +2328,10 @@ async def api_router_tower_history(
     now_utc = datetime.now(timezone.utc)
     since_utc = now_utc - timedelta(hours=hours)
     since_iso = since_utc.isoformat()
+
+    location_refresh = None
+    if refresh_location:
+        location_refresh = await refresh_router_location_cache_for_tower_map(router_id, profile_id=profile_id)
 
     with db() as conn:
         conn.row_factory = sqlite3.Row
@@ -2285,18 +2370,25 @@ async def api_router_tower_history(
             }
 
         rows = conn.execute("""
-            SELECT *
-            FROM cellular_identity_history
-            WHERE router_id = ?
-              AND profile_id = ?
+            SELECT
+                cih.*,
+                nd.connection_state AS nd_connection_state,
+                nd.carrier AS nd_carrier
+            FROM cellular_identity_history cih
+            LEFT JOIN net_devices nd
+              ON CAST(nd.id AS TEXT) = CAST(cih.net_device_id AS TEXT)
+             AND CAST(nd.router_id AS TEXT) = CAST(cih.router_id AS TEXT)
+            WHERE cih.router_id = ?
+              AND cih.profile_id = ?
               AND (
-                    is_current = 1
-                    OR COALESCE(closed_at, last_seen_ts, updated_at, created_at) >= ?
-                    OR COALESCE(first_seen_ts, created_at) >= ?
+                    cih.is_current = 1
+                    OR COALESCE(cih.closed_at, cih.last_seen_ts, cih.updated_at, cih.created_at) >= ?
+                    OR COALESCE(cih.first_seen_ts, cih.created_at) >= ?
               )
             ORDER BY
-                CASE WHEN is_current = 1 THEN 0 ELSE 1 END,
-                COALESCE(last_seen_ts, updated_at, created_at) DESC
+                CASE WHEN cih.is_current = 1 THEN 0 ELSE 1 END,
+                CASE WHEN LOWER(COALESCE(nd.connection_state, '')) = 'connected' THEN 0 ELSE 1 END,
+                COALESCE(cih.last_seen_ts, cih.updated_at, cih.created_at) DESC
         """, (router_id, profile_id, since_iso, since_iso)).fetchall()
 
     history = [_tower_history_row_to_segment(row, router_location) for row in rows]
@@ -2336,6 +2428,7 @@ async def api_router_tower_history(
         "since_utc": since_iso,
         "until_utc": now_utc.isoformat(),
         "router_location": router_location,
+        "location_refresh": location_refresh,
         "current": current,
         "current_segments": current_segments,
         "history": history,
