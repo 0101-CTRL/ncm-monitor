@@ -4953,8 +4953,8 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
 
     with db() as conn:
         conn.execute(
-            "UPDATE routers SET last_seen_utc = ? WHERE router_id = ?",
-            (now_utc(), router_id),
+            "UPDATE routers SET last_seen_utc = ? WHERE router_id = ? AND COALESCE(profile_id, 1) = ?",
+            (now_utc(), router_id, target_profile_id),
         )
 
         for item in alerts.get("data", []):
@@ -5190,8 +5190,9 @@ async def cellular_global_monitor_once(profile_id=None, include_signal: bool = F
              AND COALESCE(mp.profile_id, 1) = ?
             WHERE r.router_id IS NOT NULL
               AND TRIM(r.router_id) != ''
+              AND COALESCE(r.profile_id, 1) = ?
             ORDER BY r.bucket, r.router_id
-        """, (profile_id,)).fetchall()
+        """, (profile_id, profile_id)).fetchall()
 
         for row in rows:
             if int(row["router_paused"] or 0):
