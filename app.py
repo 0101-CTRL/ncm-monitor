@@ -13224,7 +13224,65 @@ function renderCellularMobilityCard(cellular) {{
     </div>
   `;
 
-  const changeEvents = (cellular.recent_events || []).filter(e => e.event_type !== 'first_seen').slice(0, 10);
+  const allChangeEvents = (cellular.recent_events || [])
+    .filter(e => e.event_type && e.event_type !== 'first_seen');
+
+  const changeEvents = allChangeEvents.slice(0, 10);
+
+  function cellularEventAgeHours(e) {{
+    const ts = new Date(e.detected_at || '');
+    if (Number.isNaN(ts.getTime())) return null;
+    return (Date.now() - ts.getTime()) / 3600000;
+  }}
+
+  function isTowerMobilityEvent(e) {{
+    return ['cell_id_change', 'tac_change', 'tac_and_cell_change', 'carrier_change'].includes(String(e.event_type || ''));
+  }}
+
+  function isRadioBandEvent(e) {{
+    return String(e.event_type || '') === 'radio_context_change'
+      || String(e.event_type || '') === 'service_type_change'
+      || String(e.event_type || '') === '5g_service_mode_change';
+  }}
+
+  function summarizeCellularEvents(hours) {{
+    const scoped = allChangeEvents.filter(e => {{
+      const age = cellularEventAgeHours(e);
+      return age !== null && age >= 0 && age <= hours;
+    }});
+
+    return {{
+      total: scoped.length,
+      tower: scoped.filter(isTowerMobilityEvent).length,
+      radio: scoped.filter(isRadioBandEvent).length
+    }};
+  }}
+
+  function cellularSummaryCard(label, summary) {{
+    return `
+      <div class="cellular-kpi">
+        <div class="big">${{Number(summary.total || 0)}}</div>
+        <div class="label">${{escapeHtml(label)}}</div>
+        <div class="small" style="margin-top:6px;color:#94a3b8;">
+          ${{Number(summary.tower || 0)}} tower/cell · ${{Number(summary.radio || 0)}} radio/band
+        </div>
+      </div>
+    `;
+  }}
+
+  const summary1h = summarizeCellularEvents(1);
+  const summary24h = summarizeCellularEvents(24);
+  const summary7d = {{
+    total: Number(cellular.changes_7d || 0),
+    tower: allChangeEvents.filter(e => {{
+      const age = cellularEventAgeHours(e);
+      return age !== null && age >= 0 && age <= 168 && isTowerMobilityEvent(e);
+    }}).length,
+    radio: allChangeEvents.filter(e => {{
+      const age = cellularEventAgeHours(e);
+      return age !== null && age >= 0 && age <= 168 && isRadioBandEvent(e);
+    }}).length
+  }};
 
   const eventRows = changeEvents.length ? changeEvents.map(e => `
     <tr>
@@ -13250,6 +13308,11 @@ function renderCellularMobilityCard(cellular) {{
       <td colspan="6" class="small">No cell/tower or radio-context changes recorded yet. Baseline monitoring is active.</td>
     </tr>
   `;
+
+  const eventDetailsLabel = changeEvents.length
+    ? `Show latest ${{changeEvents.length}} event detail${{changeEvents.length === 1 ? '' : 's'}}`
+    : 'Show event details';
+
 
   return `
     <div class="card">
@@ -13277,20 +13340,37 @@ function renderCellularMobilityCard(cellular) {{
       <div>${{currentText}}</div>
 
       <h3 style="margin-top:16px;">Recent cell/tower changes</h3>
-      <p class="small">Cell/tower changes are listed here. 5G service mode transitions are plotted on the signal health chart below.</p>
-      <table class="cellular-event-table">
-        <thead>
-          <tr>
-            <th>Detected</th>
-            <th>Event</th>
-            <th>Previous serving cell</th>
-            <th>New serving cell</th>
-            <th>Radio context</th>
-            <th>Signal</th>
-          </tr>
-        </thead>
-        <tbody>${{eventRows}}</tbody>
-      </table>
+      <p class="small">
+        Summary view keeps noisy mobility bursts from taking over the page. Expand details when you need the raw event list.
+      </p>
+
+      <div class="cellular-kpi-row">
+        ${{cellularSummaryCard('Last 1 hour', summary1h)}}
+        ${{cellularSummaryCard('Last 24 hours', summary24h)}}
+        ${{cellularSummaryCard('Last 7 days', summary7d)}}
+      </div>
+
+      <details style="margin-top:12px;">
+        <summary style="cursor:pointer;color:#bfdbfe;font-weight:700;">
+          ${{escapeHtml(eventDetailsLabel)}}
+        </summary>
+        <p class="small" style="margin-top:8px;">
+          Showing the latest ${{changeEvents.length}} non-baseline event${{changeEvents.length === 1 ? '' : 's'}}. 5G service mode transitions may also be plotted on the signal health chart below.
+        </p>
+        <table class="cellular-event-table">
+          <thead>
+            <tr>
+              <th>Detected</th>
+              <th>Event</th>
+              <th>Previous serving cell</th>
+              <th>New serving cell</th>
+              <th>Radio context</th>
+              <th>Signal</th>
+            </tr>
+          </thead>
+          <tbody>${{eventRows}}</tbody>
+        </table>
+      </details>
     </div>
   `;
 }}
