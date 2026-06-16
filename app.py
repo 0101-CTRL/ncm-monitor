@@ -1994,6 +1994,365 @@ def refresh_cellular_identity_history_matches(conn):
     }
 
 
+
+
+def _tower_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _tower_int(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _tower_iso(value):
+    if not value:
+        return None
+    return str(value)
+
+
+def classify_tower_rf_quality(row):
+    """
+    RF quality for tower mapping.
+
+    Preference order:
+    1. SINR, using last_sinr then avg_sinr
+    2. RSRP, using last_rsrp then avg_rsrp
+    3. Unknown
+    """
+    sinr = _tower_float(row.get("last_sinr"))
+    if sinr is None:
+        sinr = _tower_float(row.get("avg_sinr"))
+
+    rsrp = _tower_float(row.get("last_rsrp"))
+    if rsrp is None:
+        rsrp = _tower_float(row.get("avg_rsrp"))
+
+    if sinr is not None:
+        basis = "sinr"
+        value = sinr
+        if sinr >= 20:
+            quality = "excellent"
+            color = "#15803d"
+        elif sinr >= 13:
+            quality = "good"
+            color = "#65a30d"
+        elif sinr >= 5:
+            quality = "fair"
+            color = "#d97706"
+        else:
+            quality = "poor"
+            color = "#dc2626"
+        return {
+            "quality": quality,
+            "basis": basis,
+            "value": value,
+            "sinr": sinr,
+            "rsrp": rsrp,
+            "line_color": color,
+        }
+
+    if rsrp is not None:
+        basis = "rsrp"
+        value = rsrp
+        if rsrp >= -90:
+            quality = "excellent"
+            color = "#15803d"
+        elif rsrp >= -100:
+            quality = "good"
+            color = "#65a30d"
+        elif rsrp >= -110:
+            quality = "fair"
+            color = "#d97706"
+        else:
+            quality = "poor"
+            color = "#dc2626"
+        return {
+            "quality": quality,
+            "basis": basis,
+            "value": value,
+            "sinr": sinr,
+            "rsrp": rsrp,
+            "line_color": color,
+        }
+
+    return {
+        "quality": "unknown",
+        "basis": "none",
+        "value": None,
+        "sinr": None,
+        "rsrp": None,
+        "line_color": "#64748b",
+    }
+
+
+
+
+def _tower_normalize_cell_id(value):
+    """
+    Normalize NCM cell IDs for tower API use.
+
+    Examples:
+    - "21590529 (0x1497201)" -> "21590529"
+    - 21590529 -> "21590529"
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if " " in text:
+        text = text.split(" ", 1)[0].strip()
+    if "(" in text:
+        text = text.split("(", 1)[0].strip()
+    return text or None
+
+def _tower_identity_key_from_row(row):
+    """
+    Build a stable, normalized tower key for summary/playback use.
+
+    Do not rely on stored identity_key because older rows may contain
+    raw NCM cell values like "21590529 (0x1497201)".
+    """
+    mcc = str(row.get("mcc") or "").strip()
+    mnc = str(row.get("mnc") or "").strip()
+    tac = str(row.get("tac") or "").strip()
+    cell_id = _tower_normalize_cell_id(row.get("cell_id")) or str(row.get("cell_id") or "").strip()
+
+    if mcc and mnc and tac and cell_id:
+        return f"{mcc}|{mnc}|{tac}|{cell_id}"
+
+    raw = row.get("identity_key")
+    return str(raw).strip() if raw else None
+
+def _tower_history_row_to_segment(row, router_location=None):
+    row = dict(row)
+    rf = classify_tower_rf_quality(row)
+
+    tower_lat = _tower_float(row.get("opencellid_lat"))
+    tower_lon = _tower_float(row.get("opencellid_lon"))
+    has_tower_location = tower_lat is not None and tower_lon is not None and row.get("match_status") == "exact"
+    has_router_location = bool((router_location or {}).get("found"))
+    has_path = bool(has_router_location and has_tower_location)
+
+    return {
+        "id": row.get("id"),
+        "router_id": str(row.get("router_id") or ""),
+        "router_name": row.get("router_name"),
+        "profile_id": _tower_int(row.get("profile_id")),
+        "net_device_id": str(row.get("net_device_id") or "") if row.get("net_device_id") is not None else None,
+        "sim_label": row.get("sim_label"),
+        "identity": {
+            "mcc": row.get("mcc"),
+            "mnc": row.get("mnc"),
+            "tac": row.get("tac"),
+            "area": row.get("tac"),
+            "area_label": "TAC" if str(row.get("service_type") or "").upper() in ("LTE", "5G NSA", "5G") else "Area",
+            "cell_id": _tower_normalize_cell_id(row.get("cell_id")) or row.get("cell_id"),
+            "identity_key": row.get("identity_key"),
+            "tower_key": _tower_identity_key_from_row(row),
+        },
+        "radio": {
+            "service_type": row.get("service_type"),
+            "rfband": row.get("rfband"),
+            "rfband5g": row.get("rfband5g"),
+            "rfchannel": row.get("rfchannel"),
+            "ltebandwidth": row.get("ltebandwidth"),
+            "mtu": row.get("mtu"),
+        },
+        "window": {
+            "first_seen_ts": _tower_iso(row.get("first_seen_ts")),
+            "last_seen_ts": _tower_iso(row.get("last_seen_ts")),
+            "last_sample_ts": _tower_iso(row.get("last_sample_ts")),
+            "closed_at": _tower_iso(row.get("closed_at")),
+            "is_current": bool(row.get("is_current")),
+            "sample_count": _tower_int(row.get("sample_count")) or 0,
+        },
+        "match": {
+            "status": row.get("match_status") or "unmatched",
+            "updated_at": _tower_iso(row.get("match_updated_at")),
+        },
+        "tower": {
+            "found": has_tower_location,
+            "lat": tower_lat,
+            "lon": tower_lon,
+            "range_m": _tower_int(row.get("opencellid_range_m")),
+            "samples": _tower_int(row.get("opencellid_samples")),
+            "updated": _tower_int(row.get("opencellid_updated")),
+            "mcc": row.get("opencellid_mcc"),
+            "mnc": row.get("opencellid_mnc"),
+            "tac": row.get("opencellid_tac"),
+            "cell_id": row.get("opencellid_cell_id"),
+        },
+        "rf": {
+            "quality": rf["quality"],
+            "basis": rf["basis"],
+            "value": rf["value"],
+            "line_color": rf["line_color"],
+            "last": {
+                "dbm": _tower_float(row.get("last_dbm")),
+                "rsrp": _tower_float(row.get("last_rsrp")),
+                "rsrq": _tower_float(row.get("last_rsrq")),
+                "sinr": _tower_float(row.get("last_sinr")),
+                "signal_strength": _tower_float(row.get("last_signal_strength")),
+            },
+            "avg": {
+                "dbm": _tower_float(row.get("avg_dbm")),
+                "rsrp": _tower_float(row.get("avg_rsrp")),
+                "rsrq": _tower_float(row.get("avg_rsrq")),
+                "sinr": _tower_float(row.get("avg_sinr")),
+                "signal_strength": _tower_float(row.get("avg_signal_strength")),
+            },
+            "sample_counts": {
+                "dbm": _tower_int(row.get("dbm_sample_count")) or 0,
+                "rsrp": _tower_int(row.get("rsrp_sample_count")) or 0,
+                "rsrq": _tower_int(row.get("rsrq_sample_count")) or 0,
+                "sinr": _tower_int(row.get("sinr_sample_count")) or 0,
+                "signal_strength": _tower_int(row.get("signal_strength_sample_count")) or 0,
+            },
+        },
+        "map": {
+            "has_router_location": has_router_location,
+            "has_tower_location": has_tower_location,
+            "has_path": has_path,
+            "line_color": rf["line_color"],
+            "router_lat": (router_location or {}).get("lat"),
+            "router_lon": (router_location or {}).get("lon"),
+            "tower_lat": tower_lat,
+            "tower_lon": tower_lon,
+        },
+    }
+
+
+@app.get("/api/router/{router_id}/tower-history")
+async def api_router_tower_history(
+    router_id: str,
+    profile_id: int = Query(1),
+    hours: int = Query(168, ge=1, le=2160),
+):
+    profile_id = normalize_profile_id(profile_id)
+    router_id = str(router_id).strip()
+    if not router_id:
+        raise HTTPException(status_code=400, detail="router_id is required")
+
+    now_utc = datetime.now(timezone.utc)
+    since_utc = now_utc - timedelta(hours=hours)
+    since_iso = since_utc.isoformat()
+
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+
+        loc = conn.execute("""
+            SELECT router_id, latitude, longitude, accuracy, method, updated_at
+            FROM locations
+            WHERE router_id = ?
+            LIMIT 1
+        """, (router_id,)).fetchone()
+
+        if loc:
+            router_location = {
+                "found": True,
+                "router_id": str(loc["router_id"]),
+                "lat": _tower_float(loc["latitude"]),
+                "lon": _tower_float(loc["longitude"]),
+                "accuracy": _tower_float(loc["accuracy"]),
+                "method": loc["method"],
+                "updated_at": loc["updated_at"],
+                "updated_at_local": to_local_string(loc["updated_at"]),
+                "source": "locations",
+            }
+        else:
+            router_location = {
+                "found": False,
+                "router_id": router_id,
+                "lat": None,
+                "lon": None,
+                "accuracy": None,
+                "method": None,
+                "updated_at": None,
+                "updated_at_local": None,
+                "source": "locations",
+                "message": "No cached router location is available. Enable or refresh the Location module to draw router-to-tower paths.",
+            }
+
+        rows = conn.execute("""
+            SELECT *
+            FROM cellular_identity_history
+            WHERE router_id = ?
+              AND profile_id = ?
+              AND (
+                    is_current = 1
+                    OR COALESCE(closed_at, last_seen_ts, updated_at, created_at) >= ?
+                    OR COALESCE(first_seen_ts, created_at) >= ?
+              )
+            ORDER BY
+                CASE WHEN is_current = 1 THEN 0 ELSE 1 END,
+                COALESCE(last_seen_ts, updated_at, created_at) DESC
+        """, (router_id, profile_id, since_iso, since_iso)).fetchall()
+
+    history = [_tower_history_row_to_segment(row, router_location) for row in rows]
+    current_segments = [item for item in history if item["window"]["is_current"]]
+    current = current_segments[0] if current_segments else None
+
+    quality_counts = {
+        "excellent": 0,
+        "good": 0,
+        "fair": 0,
+        "poor": 0,
+        "unknown": 0,
+    }
+    unique_identity_keys = set()
+    exact_matches = 0
+    map_ready_segments = 0
+
+    for item in history:
+        q = item["rf"]["quality"] or "unknown"
+        quality_counts[q] = quality_counts.get(q, 0) + 1
+
+        key = item["identity"].get("tower_key") or item["identity"].get("identity_key")
+        if key:
+            unique_identity_keys.add(key)
+
+        if item["match"]["status"] == "exact":
+            exact_matches += 1
+
+        if item["map"]["has_path"]:
+            map_ready_segments += 1
+
+    return {
+        "ok": True,
+        "router_id": router_id,
+        "profile_id": profile_id,
+        "hours": hours,
+        "since_utc": since_iso,
+        "until_utc": now_utc.isoformat(),
+        "router_location": router_location,
+        "current": current,
+        "current_segments": current_segments,
+        "history": history,
+        "summary": {
+            "segments": len(history),
+            "current_segments": len(current_segments),
+            "exact_matches": exact_matches,
+            "unique_towers": len(unique_identity_keys),
+            "map_ready_segments": map_ready_segments,
+            "quality_counts": quality_counts,
+            "has_router_location": router_location["found"],
+            "has_current_tower": bool(current and current["tower"]["found"]),
+            "has_current_path": bool(current and current["map"]["has_path"]),
+        },
+    }
+
+
 @app.get("/api/opencellid/status")
 async def api_opencellid_status():
     ensure_cellular_monitor_tables()
