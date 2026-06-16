@@ -8164,7 +8164,7 @@ async def api_router_cellular_summary(
     profile_id: int = None,
     hours: int = 168,
 ):
-    profile_id = 1
+    profile_id = normalize_profile_id(profile_id)
     ensure_cellular_monitor_tables(profile_id)
 
     since = (datetime.now(timezone.utc) - timedelta(hours=int(hours))).isoformat()
@@ -8176,25 +8176,29 @@ async def api_router_cellular_summary(
             SELECT *
             FROM cellular_current_state
             WHERE router_id = ?
+              AND COALESCE(profile_id, 1) = ?
             ORDER BY last_seen_ts DESC
-        """, (str(router_id),)).fetchall()
+        """, (str(router_id), profile_id)).fetchall()
 
         total_changes = conn.execute("""
             SELECT COUNT(*) AS c
             FROM cellular_events
             WHERE router_id = ?
+              AND COALESCE(profile_id, 1) = ?
               AND event_type != 'first_seen'
               AND detected_at >= ?
-        """, (str(router_id), since)).fetchone()["c"]
+        """, (str(router_id), profile_id, since)).fetchone()["c"]
 
         changes_24h = conn.execute("""
             SELECT COUNT(*) AS c
             FROM cellular_events
             WHERE router_id = ?
+              AND COALESCE(profile_id, 1) = ?
               AND event_type != 'first_seen'
               AND detected_at >= ?
         """, (
             str(router_id),
+            profile_id,
             (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(),
         )).fetchone()["c"]
 
@@ -8202,10 +8206,12 @@ async def api_router_cellular_summary(
             SELECT COUNT(*) AS c
             FROM cellular_events
             WHERE router_id = ?
+              AND COALESCE(profile_id, 1) = ?
               AND event_type != 'first_seen'
               AND detected_at >= ?
         """, (
             str(router_id),
+            profile_id,
             (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),
         )).fetchone()["c"]
 
@@ -8213,9 +8219,10 @@ async def api_router_cellular_summary(
             SELECT *
             FROM cellular_events
             WHERE router_id = ?
+              AND COALESCE(profile_id, 1) = ?
             ORDER BY detected_at DESC
             LIMIT 25
-        """, (str(router_id),)).fetchall()
+        """, (str(router_id), profile_id)).fetchall()
 
         timeline = conn.execute("""
             SELECT
@@ -8224,11 +8231,12 @@ async def api_router_cellular_summary(
                 COUNT(*) AS count
             FROM cellular_events
             WHERE router_id = ?
+              AND COALESCE(profile_id, 1) = ?
               AND event_type != 'first_seen'
               AND detected_at >= ?
             GROUP BY bucket_utc, event_type
             ORDER BY bucket_utc ASC
-        """, (str(router_id), since)).fetchall()
+        """, (str(router_id), profile_id, since)).fetchall()
 
     return {
         "profile_id": profile_id,
@@ -8249,7 +8257,7 @@ async def api_router_cellular_timeline(
     profile_id: int = None,
     hours: int = 168,
 ):
-    profile_id = 1
+    profile_id = normalize_profile_id(profile_id)
     ensure_cellular_monitor_tables(profile_id)
 
     since = (datetime.now(timezone.utc) - timedelta(hours=int(hours))).isoformat()
@@ -8263,11 +8271,12 @@ async def api_router_cellular_timeline(
                 COUNT(*) AS change_count
             FROM cellular_events
             WHERE router_id = ?
+              AND COALESCE(profile_id, 1) = ?
               AND event_type != 'first_seen'
               AND detected_at >= ?
             GROUP BY bucket_utc
             ORDER BY bucket_utc ASC
-        """, (str(router_id), since)).fetchall()
+        """, (str(router_id), profile_id, since)).fetchall()
 
     return {
         "profile_id": profile_id,
@@ -8279,7 +8288,7 @@ async def api_router_cellular_timeline(
 
 @app.get("/api/cellular/events")
 async def api_cellular_events(profile_id: int = None, limit: int = 100):
-    profile_id = 1
+    profile_id = normalize_profile_id(profile_id)
     ensure_cellular_monitor_tables(profile_id)
 
     with db() as conn:
@@ -8287,9 +8296,10 @@ async def api_cellular_events(profile_id: int = None, limit: int = 100):
         rows = conn.execute("""
             SELECT *
             FROM cellular_events
+            WHERE COALESCE(profile_id, 1) = ?
             ORDER BY detected_at DESC
             LIMIT ?
-        """, (int(limit),)).fetchall()
+        """, (profile_id, int(limit))).fetchall()
 
     return {
         "profile_id": profile_id,
@@ -8299,7 +8309,7 @@ async def api_cellular_events(profile_id: int = None, limit: int = 100):
 
 @app.get("/api/cellular/summary")
 async def api_cellular_summary(profile_id: int = None):
-    profile_id = 1
+    profile_id = normalize_profile_id(profile_id)
     ensure_cellular_monitor_tables(profile_id)
 
     with db() as conn:
@@ -8308,19 +8318,22 @@ async def api_cellular_summary(profile_id: int = None):
         tracked = conn.execute("""
             SELECT COUNT(*) AS c
             FROM cellular_current_state
-        """).fetchone()["c"]
+            WHERE COALESCE(profile_id, 1) = ?
+        """, (profile_id,)).fetchone()["c"]
 
         events = conn.execute("""
             SELECT COUNT(*) AS c
             FROM cellular_events
-            WHERE event_type != 'first_seen'
-        """).fetchone()["c"]
+            WHERE COALESCE(profile_id, 1) = ?
+              AND event_type != 'first_seen'
+        """, (profile_id,)).fetchone()["c"]
 
         first_seen = conn.execute("""
             SELECT COUNT(*) AS c
             FROM cellular_events
-            WHERE event_type = 'first_seen'
-        """).fetchone()["c"]
+            WHERE COALESCE(profile_id, 1) = ?
+              AND event_type = 'first_seen'
+        """, (profile_id,)).fetchone()["c"]
 
         last_run = conn.execute("""
             SELECT value
