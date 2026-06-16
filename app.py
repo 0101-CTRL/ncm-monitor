@@ -5922,6 +5922,96 @@ def store_router_log_rows(raw_rows, profile_id, router_id):
         return conn.total_changes - before
 
 
+async def fetch_and_cache_router_logs_window(
+    router_id,
+    profile_id,
+    since,
+    until=None,
+    limit=1000,
+    max_pages=25,
+):
+    """Fetch router logs from NCM with offset paging and cache each page.
+
+    NCM can return the earliest rows in a requested window. On noisy routers, a
+    single 500/1000-row response may not reach the newest logs for the day.
+    This helper walks pages using offset where supported and stops if the API
+    repeats a page.
+    """
+    profile_id_filter = normalize_profile_id(profile_id)
+    router_id_str = str(router_id)
+
+    # NCM router_logs appears to cap responses at 500 rows even when a higher
+    # limit is requested. Use 500 as the effective page size so offset paging
+    # can continue instead of stopping after the first capped response.
+    page_limit = 500
+
+    all_rows = []
+    total_cached = 0
+    seen_page_signatures = set()
+    last_meta = {}
+    live_fetch_error = None
+
+    for page in range(int(max_pages or 1)):
+        params = {
+            "router": router_id_str,
+            "created_at__gt": since,
+            "limit": page_limit,
+        }
+        if until:
+            params["created_at__lt"] = until
+        if page > 0:
+            params["offset"] = page * page_limit
+
+        try:
+            payload = await ncm_get(
+                "/api/v2/router_logs/",
+                params,
+                profile_id=profile_id_filter,
+            )
+        except Exception as exc:
+            live_fetch_error = str(exc)
+            break
+
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        last_meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+
+        if not rows:
+            break
+
+        # Detect repeated pages in case the endpoint ignores offset.
+        first = rows[0] if isinstance(rows[0], dict) else {}
+        last = rows[-1] if isinstance(rows[-1], dict) else {}
+        signature = (
+            str(first.get("created_at_timeuuid") or first.get("id") or first.get("uuid") or ""),
+            str(first.get("reported_at") or ""),
+            str(first.get("created_at") or ""),
+            str(first.get("message") or "")[:120],
+            str(last.get("created_at_timeuuid") or last.get("id") or last.get("uuid") or ""),
+            str(last.get("reported_at") or ""),
+            str(last.get("created_at") or ""),
+            str(last.get("message") or "")[:120],
+            str(len(rows)),
+        )
+        if signature in seen_page_signatures:
+            break
+        seen_page_signatures.add(signature)
+
+        all_rows.extend(rows)
+        total_cached += store_router_log_rows(rows, profile_id_filter, router_id_str)
+
+        if len(rows) < page_limit:
+            break
+
+    return {
+        "rows": all_rows,
+        "fetched_count": len(all_rows),
+        "cached_count": total_cached,
+        "pages": len(seen_page_signatures),
+        "meta": last_meta,
+        "live_fetch_error": live_fetch_error,
+    }
+
+
 def normalize_cached_router_log_row(row, event_dt=None):
     """Return cached router log with local time and optional event delta."""
     item = dict(row)
@@ -5950,35 +6040,89 @@ async def api_router_logs(
     profile_id: int = Query(default=None),
     limit: int = Query(250, ge=20, le=1000),
 ):
-    """Fetch router logs for a router using the selected dashboard profile credentials.
+    """Fetch latest available router logs for the selected dashboard profile.
 
-    This is the production endpoint behind the future UI modal.
+    The live NCM response is cached first, then the modal is populated from the
+    local router_logs cache. This keeps the standalone Router Logs button aligned
+    with Event Context, which already relies on cached rows and local timestamp
+    filtering.
     """
     profile_id_filter = normalize_profile_id(profile_id)
     since = router_log_days_to_since(days)
+    since_dt = parse_router_log_dt(since)
 
-    payload = await ncm_get(
-        "/api/v2/router_logs/",
-        {
-            "router": router_id,
-            "created_at__gt": since,
-            "limit": limit,
-        },
+    fetched_live_count = 0
+    cached_count = 0
+    live_fetch_error = None
+    meta = {}
+
+    fetch_result = await fetch_and_cache_router_logs_window(
+        router_id=router_id,
         profile_id=profile_id_filter,
+        since=since,
+        until=None,
+        limit=max(int(limit or 1000), 1000),
+        max_pages=25,
     )
+    fetched_live_count = fetch_result.get("fetched_count", 0)
+    cached_count = fetch_result.get("cached_count", 0)
+    meta = fetch_result.get("meta", {}) or {}
+    live_fetch_error = fetch_result.get("live_fetch_error")
 
-    rows = payload.get("data", []) if isinstance(payload, dict) else []
-    cached_count = store_router_log_rows(rows, profile_id_filter, router_id)
-    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        candidate_rows = conn.execute("""
+            SELECT
+                profile_id,
+                log_key,
+                router_id,
+                reported_at,
+                created_at,
+                level,
+                source,
+                message,
+                exception,
+                sequence,
+                created_at_timeuuid,
+                fetched_at
+            FROM router_logs
+            WHERE profile_id = ?
+              AND router_id = ?
+            ORDER BY COALESCE(reported_at, created_at) DESC
+            LIMIT ?
+        """, (
+            profile_id_filter,
+            str(router_id),
+            int(max(limit, 1000)),
+        )).fetchall()
+
+    filtered_rows = []
+    for row in candidate_rows:
+        reported_dt = parse_router_log_dt(row["reported_at"])
+        created_dt = parse_router_log_dt(row["created_at"])
+
+        timestamps = [dt for dt in (reported_dt, created_dt) if dt]
+        if not timestamps:
+            continue
+
+        if since_dt and not any(dt >= since_dt for dt in timestamps):
+            continue
+
+        filtered_rows.append(row)
+
+    normalized_logs = [normalize_cached_router_log_row(r) for r in filtered_rows[:int(limit)]]
 
     return {
         "router_id": router_id,
         "profile_id": profile_id_filter,
         "days": days,
         "since_utc": since,
-        "count": len(rows),
+        "count": len(normalized_logs),
+        "fetched_live_count": fetched_live_count,
         "cached_count": cached_count,
-        "logs": [normalize_router_log_row(r) for r in rows],
+        "cache_candidate_count": len(candidate_rows),
+        "live_fetch_error": live_fetch_error,
+        "logs": normalized_logs,
         "meta": meta,
     }
 
@@ -6049,39 +6193,38 @@ async def api_event_context_logs(
         try:
             raw_rows = []
 
-            # Strategy 1: bounded by created_at.
-            live_fetch_mode = "created_at_bounded"
-            payload = await ncm_get(
-                "/api/v2/router_logs/",
-                {
-                    "router": router_id,
-                    "created_at__gt": since,
-                    "created_at__lt": until,
-                    "limit": limit,
-                },
+            # Strategy 1: bounded by created_at, with paging.
+            live_fetch_mode = "created_at_bounded_paged"
+            fetch_result = await fetch_and_cache_router_logs_window(
+                router_id=router_id,
                 profile_id=profile_id_filter,
+                since=since,
+                until=until,
+                limit=max(int(limit or 1000), 1000),
+                max_pages=25,
             )
-            raw_rows = payload.get("data", []) if isinstance(payload, dict) else []
+            raw_rows = fetch_result.get("rows", []) or []
+            fetched_live_count = fetch_result.get("fetched_count", 0)
+            if fetch_result.get("live_fetch_error"):
+                live_fetch_error = fetch_result.get("live_fetch_error")
 
             # Strategy 2: broad fallback. Router logs API does not support
             # reported_at filters, so use created_at__gt broadly and filter locally
             # by parsed reported_at/created_at timestamps.
-            if len(raw_rows) == 0:
-                live_fetch_mode = "broad_since"
-                broad_limit = max(int(limit or 1000), 5000)
-                payload = await ncm_get(
-                    "/api/v2/router_logs/",
-                    {
-                        "router": router_id,
-                        "created_at__gt": since,
-                        "limit": broad_limit,
-                    },
+            if len(raw_rows) == 0 and not live_fetch_error:
+                live_fetch_mode = "broad_since_paged"
+                fetch_result = await fetch_and_cache_router_logs_window(
+                    router_id=router_id,
                     profile_id=profile_id_filter,
+                    since=since,
+                    until=None,
+                    limit=5000,
+                    max_pages=25,
                 )
-                raw_rows = payload.get("data", []) if isinstance(payload, dict) else []
-
-            fetched_live_count = len(raw_rows)
-            store_router_log_rows(raw_rows, profile_id_filter, router_id)
+                raw_rows = fetch_result.get("rows", []) or []
+                fetched_live_count = fetch_result.get("fetched_count", 0)
+                if fetch_result.get("live_fetch_error"):
+                    live_fetch_error = fetch_result.get("live_fetch_error")
 
         except Exception as exc:
             # Event Context should not fail completely just because the live
@@ -6153,7 +6296,25 @@ async def api_event_context_logs(
         if window_match:
             filtered_rows.append(row)
 
-    logs = [normalize_cached_router_log_row(r, event_dt=event_dt) for r in filtered_rows[:int(limit)]]
+    # Event Context should show logs nearest to the clicked graph anchor, not
+    # simply the first rows in a noisy daily window. For high-volume routers,
+    # the first 1000 logs of a day can be hours away from the selected point.
+    normalized_all_logs = [normalize_cached_router_log_row(r, event_dt=event_dt) for r in filtered_rows]
+
+    normalized_all_logs.sort(
+        key=lambda item: (
+            abs(item.get("delta_seconds")) if item.get("delta_seconds") is not None else 999999999,
+            item.get("reported_at") or item.get("created_at") or "",
+        )
+    )
+
+    logs = normalized_all_logs[:int(limit)]
+
+    logs.sort(
+        key=lambda item: (
+            parse_router_log_dt(item.get("reported_at") or item.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)
+        )
+    )
 
     closest_index = None
     closest_before_index = None
