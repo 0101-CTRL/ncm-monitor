@@ -1635,6 +1635,443 @@ def ensure_cellular_monitor_tables(profile_id=None):
 
 
 
+
+
+def _opencellid_bool(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _opencellid_row_value(row: dict, *names):
+    lowered = {str(k or "").strip().lower(): v for k, v in row.items()}
+    for name in names:
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+    return None
+
+
+def _opencellid_text(value) -> str:
+    value = _cellular_identity_value(value)
+    return value
+
+
+def _opencellid_int(value):
+    value = _cellular_identity_value(value)
+    if value == "":
+        return None
+    try:
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _opencellid_float(value):
+    value = _cellular_identity_value(value)
+    if value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _opencellid_import_summary(conn):
+    latest = conn.execute("""
+        SELECT *
+        FROM opencellid_imports
+        ORDER BY id DESC
+        LIMIT 1
+    """).fetchone()
+
+    counts = conn.execute("""
+        SELECT
+            COUNT(*) AS total_cells,
+            COUNT(DISTINCT mcc || '|' || mnc) AS networks,
+            COUNT(DISTINCT mcc || '|' || mnc || '|' || tac) AS areas
+        FROM opencellid_cells
+    """).fetchone()
+
+    history = conn.execute("""
+        SELECT
+            COUNT(*) AS history_rows,
+            SUM(CASE WHEN match_status = 'exact' THEN 1 ELSE 0 END) AS exact_matches,
+            SUM(CASE WHEN match_status = 'unmatched' THEN 1 ELSE 0 END) AS unmatched
+        FROM cellular_identity_history
+    """).fetchone()
+
+    return {
+        "cells": {
+            "total": int(counts["total_cells"] or 0),
+            "networks": int(counts["networks"] or 0),
+            "areas": int(counts["areas"] or 0),
+        },
+        "history": {
+            "rows": int(history["history_rows"] or 0),
+            "exact_matches": int(history["exact_matches"] or 0),
+            "unmatched": int(history["unmatched"] or 0),
+        },
+        "latest_import": dict(latest) if latest else None,
+    }
+
+
+def refresh_cellular_identity_history_matches(conn):
+    """Refresh OpenCellID exact matches for existing cellular identity history rows."""
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute("""
+        SELECT id, mcc, mnc, tac, cell_id
+        FROM cellular_identity_history
+        WHERE COALESCE(TRIM(mcc), '') != ''
+          AND COALESCE(TRIM(mnc), '') != ''
+          AND COALESCE(TRIM(tac), '') != ''
+          AND COALESCE(TRIM(cell_id), '') != ''
+    """).fetchall()
+
+    checked = 0
+    exact = 0
+    unmatched = 0
+    now = now_utc()
+
+    for row in rows:
+        checked += 1
+        match = lookup_opencellid_cell(conn, row["mcc"], row["mnc"], row["tac"], row["cell_id"])
+
+        if match:
+            exact += 1
+            conn.execute("""
+                UPDATE cellular_identity_history
+                SET
+                    match_status = 'exact',
+                    match_updated_at = ?,
+                    opencellid_mcc = ?,
+                    opencellid_mnc = ?,
+                    opencellid_tac = ?,
+                    opencellid_cell_id = ?,
+                    opencellid_lat = ?,
+                    opencellid_lon = ?,
+                    opencellid_range_m = ?,
+                    opencellid_samples = ?,
+                    opencellid_updated = ?,
+                    updated_at = ?
+                WHERE id = ?
+            """, (
+                now,
+                match["mcc"],
+                match["mnc"],
+                match["tac"],
+                match["cell_id"],
+                match["lat"],
+                match["lon"],
+                match["range_m"],
+                match["samples"],
+                match["updated"],
+                now,
+                row["id"],
+            ))
+        else:
+            unmatched += 1
+            conn.execute("""
+                UPDATE cellular_identity_history
+                SET
+                    match_status = 'unmatched',
+                    match_updated_at = ?,
+                    opencellid_mcc = NULL,
+                    opencellid_mnc = NULL,
+                    opencellid_tac = NULL,
+                    opencellid_cell_id = NULL,
+                    opencellid_lat = NULL,
+                    opencellid_lon = NULL,
+                    opencellid_range_m = NULL,
+                    opencellid_samples = NULL,
+                    opencellid_updated = NULL,
+                    updated_at = ?
+                WHERE id = ?
+            """, (now, now, row["id"]))
+
+    return {
+        "checked": checked,
+        "exact": exact,
+        "unmatched": unmatched,
+    }
+
+
+@app.get("/api/opencellid/status")
+async def api_opencellid_status():
+    ensure_cellular_monitor_tables()
+
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        return _opencellid_import_summary(conn)
+
+
+@app.post("/api/opencellid/import")
+async def api_opencellid_import(
+    file: UploadFile = File(...),
+    replace_existing: str = Form("false"),
+    rematch_history: str = Form("true"),
+):
+    """
+    Import an OpenCellID CSV export.
+
+    Supported common headers:
+    - radio
+    - mcc
+    - net or mnc
+    - area, lac, or tac
+    - cell, cid, or cell_id
+    - lon/lng/longitude
+    - lat/latitude
+    - range/range_m
+    - samples
+    - changeable
+    - created
+    - updated
+    - averageSignal or average_signal
+    """
+    ensure_cellular_monitor_tables()
+
+    source_file = Path(file.filename or "opencellid.csv").name
+    imported_at = now_utc()
+    replace_existing_bool = _opencellid_bool(replace_existing)
+    rematch_history_bool = _opencellid_bool(rematch_history)
+
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+
+        cur = conn.execute("""
+            INSERT INTO opencellid_imports (
+                source_file,
+                imported_at,
+                rows_seen,
+                rows_inserted,
+                rows_updated,
+                rows_skipped,
+                status,
+                notes
+            )
+            VALUES (?, ?, 0, 0, 0, 0, 'running', ?)
+        """, (
+            source_file,
+            imported_at,
+            "OpenCellID CSV import started.",
+        ))
+        import_id = cur.lastrowid
+
+        rows_seen = 0
+        rows_inserted = 0
+        rows_updated = 0
+        rows_skipped = 0
+        rematch_result = None
+
+        try:
+            if replace_existing_bool:
+                conn.execute("DELETE FROM opencellid_cells")
+
+            raw = await file.read()
+            if not raw:
+                raise HTTPException(status_code=400, detail="CSV file is empty.")
+
+            text_stream = io.StringIO(raw.decode("utf-8-sig", errors="replace"), newline="")
+            reader = csv.DictReader(text_stream)
+
+            if not reader.fieldnames:
+                raise HTTPException(status_code=400, detail="CSV file has no header row.")
+
+            for row in reader:
+                rows_seen += 1
+
+                radio = _opencellid_text(_opencellid_row_value(row, "radio"))
+                mcc = _opencellid_text(_opencellid_row_value(row, "mcc"))
+                mnc = _opencellid_text(_opencellid_row_value(row, "net", "mnc"))
+                tac = _opencellid_text(_opencellid_row_value(row, "area", "lac", "tac"))
+                cell_id = _opencellid_text(_opencellid_row_value(row, "cell", "cid", "cell_id"))
+
+                if not all((mcc, mnc, tac, cell_id)):
+                    rows_skipped += 1
+                    continue
+
+                unit = _opencellid_text(_opencellid_row_value(row, "unit"))
+                lon = _opencellid_float(_opencellid_row_value(row, "lon", "lng", "longitude"))
+                lat = _opencellid_float(_opencellid_row_value(row, "lat", "latitude"))
+                range_m = _opencellid_int(_opencellid_row_value(row, "range", "range_m"))
+                samples = _opencellid_int(_opencellid_row_value(row, "samples"))
+                changeable = _opencellid_int(_opencellid_row_value(row, "changeable"))
+                created = _opencellid_int(_opencellid_row_value(row, "created"))
+                updated = _opencellid_int(_opencellid_row_value(row, "updated"))
+                average_signal = _opencellid_int(_opencellid_row_value(row, "averageSignal", "average_signal"))
+
+                existing = conn.execute("""
+                    SELECT 1
+                    FROM opencellid_cells
+                    WHERE mcc = ?
+                      AND mnc = ?
+                      AND tac = ?
+                      AND cell_id = ?
+                    LIMIT 1
+                """, (mcc, mnc, tac, cell_id)).fetchone()
+
+                if existing:
+                    rows_updated += 1
+                else:
+                    rows_inserted += 1
+
+                conn.execute("""
+                    INSERT INTO opencellid_cells (
+                        radio,
+                        mcc,
+                        mnc,
+                        area,
+                        tac,
+                        cell_id,
+                        unit,
+                        lon,
+                        lat,
+                        range_m,
+                        samples,
+                        changeable,
+                        created,
+                        updated,
+                        average_signal,
+                        source_file,
+                        imported_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(mcc, mnc, tac, cell_id) DO UPDATE SET
+                        radio = excluded.radio,
+                        area = excluded.area,
+                        unit = excluded.unit,
+                        lon = excluded.lon,
+                        lat = excluded.lat,
+                        range_m = excluded.range_m,
+                        samples = excluded.samples,
+                        changeable = excluded.changeable,
+                        created = excluded.created,
+                        updated = excluded.updated,
+                        average_signal = excluded.average_signal,
+                        source_file = excluded.source_file,
+                        imported_at = excluded.imported_at
+                """, (
+                    radio,
+                    mcc,
+                    mnc,
+                    tac,
+                    tac,
+                    cell_id,
+                    unit,
+                    lon,
+                    lat,
+                    range_m,
+                    samples,
+                    changeable,
+                    created,
+                    updated,
+                    average_signal,
+                    source_file,
+                    imported_at,
+                ))
+
+                if rows_seen % 1000 == 0:
+                    conn.execute("""
+                        UPDATE opencellid_imports
+                        SET
+                            rows_seen = ?,
+                            rows_inserted = ?,
+                            rows_updated = ?,
+                            rows_skipped = ?,
+                            notes = ?
+                        WHERE id = ?
+                    """, (
+                        rows_seen,
+                        rows_inserted,
+                        rows_updated,
+                        rows_skipped,
+                        f"Import running. Last checkpoint at row {rows_seen}.",
+                        import_id,
+                    ))
+                    conn.commit()
+
+            if rematch_history_bool:
+                rematch_result = refresh_cellular_identity_history_matches(conn)
+
+            conn.execute("""
+                UPDATE opencellid_imports
+                SET
+                    rows_seen = ?,
+                    rows_inserted = ?,
+                    rows_updated = ?,
+                    rows_skipped = ?,
+                    status = 'complete',
+                    notes = ?
+                WHERE id = ?
+            """, (
+                rows_seen,
+                rows_inserted,
+                rows_updated,
+                rows_skipped,
+                "Import complete.",
+                import_id,
+            ))
+
+            conn.commit()
+
+            summary = _opencellid_import_summary(conn)
+            summary["import_result"] = {
+                "import_id": import_id,
+                "source_file": source_file,
+                "rows_seen": rows_seen,
+                "rows_inserted": rows_inserted,
+                "rows_updated": rows_updated,
+                "rows_skipped": rows_skipped,
+                "replace_existing": replace_existing_bool,
+                "rematch_history": rematch_history_bool,
+                "rematch_result": rematch_result,
+            }
+            return summary
+
+        except HTTPException:
+            conn.execute("""
+                UPDATE opencellid_imports
+                SET
+                    rows_seen = ?,
+                    rows_inserted = ?,
+                    rows_updated = ?,
+                    rows_skipped = ?,
+                    status = 'failed',
+                    notes = ?
+                WHERE id = ?
+            """, (
+                rows_seen,
+                rows_inserted,
+                rows_updated,
+                rows_skipped,
+                "Import failed due to invalid CSV input.",
+                import_id,
+            ))
+            conn.commit()
+            raise
+        except Exception as exc:
+            conn.execute("""
+                UPDATE opencellid_imports
+                SET
+                    rows_seen = ?,
+                    rows_inserted = ?,
+                    rows_updated = ?,
+                    rows_skipped = ?,
+                    status = 'failed',
+                    notes = ?
+                WHERE id = ?
+            """, (
+                rows_seen,
+                rows_inserted,
+                rows_updated,
+                rows_skipped,
+                f"Import failed: {exc}",
+                import_id,
+            ))
+            conn.commit()
+            raise HTTPException(status_code=500, detail=f"OpenCellID import failed: {exc}")
+
+
+
 def platform_from_bucket(bucket):
     b = (bucket or "").upper()
     # Bucket-based fallback: No SDK2 population is S400; E100 Swaps are E100.
