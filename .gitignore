@@ -53,3 +53,8 @@ exports/
 tmp/
 *.xlsx
 *.csv
+
+# Local runtime secrets and data
+*.pyc
+*.bak
+*.bak-*
