@@ -7177,29 +7177,76 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
         )
         conn.execute("DELETE FROM net_devices WHERE router_id = ?", (router_id,))
 
+        usage_net_devices = []
+
         for item in net_devices.get("data", []):
-            if item.get("type") != "mdm":
+            net_device_id_raw = item.get("id")
+            if not net_device_id_raw:
                 continue
 
+            net_device_id = str(net_device_id_raw)
+            nd_type = (item.get("type") or "").strip().lower()
+            is_cellular = nd_type == "mdm"
+
             mfg_product = item.get("mfg_product") or item.get("model") or ""
+
+            nd_text = " ".join(str(v or "") for v in [
+                nd_type,
+                item.get("name"),
+                item.get("display_name"),
+                item.get("interface"),
+                item.get("port"),
+                item.get("carrier"),
+                item.get("mfg_product"),
+                item.get("model"),
+                item.get("service_type"),
+            ]).lower()
+
+            is_wired_wan = (not is_cellular) and (
+                "wan" in nd_text
+                or "internet" in nd_text
+            )
+
+            if not is_cellular and not is_wired_wan:
+                print(
+                    f"[net-devices] Skipping non-WAN net_device {item.get('id')} "
+                    f"for router {router_id}: type={nd_type} "
+                    f"name={item.get('name') or item.get('display_name') or mfg_product}"
+                )
+                continue
 
             # Stock build scope guard:
             # Removable/insertable MC400-style modem modules can expose duplicate
             # SIM1/SIM2 interfaces alongside internal radios. This standard build
             # is intended for fixed router inventory analysis, so skip MC400 module
             # interfaces rather than rendering them as normal WAN/SIM state.
-            if "MC400" in mfg_product.upper():
+            if is_cellular and "MC400" in mfg_product.upper():
                 print(f"[net-devices] Skipping unsupported removable module net_device {item.get('id')} for router {router_id}: {mfg_product}")
                 continue
 
-            if "SIM1" in mfg_product.upper():
-                sim_label = "SIM1"
-            elif "SIM2" in mfg_product.upper():
-                sim_label = "SIM2"
+            if is_cellular:
+                if "SIM1" in mfg_product.upper():
+                    sim_label = "SIM1"
+                elif "SIM2" in mfg_product.upper():
+                    sim_label = "SIM2"
+                else:
+                    sim_label = "CELLULAR"
             else:
-                sim_label = "UNKNOWN"
-
-            net_device_id = str(item.get("id"))
+                label_candidates = [
+                    item.get("name"),
+                    item.get("display_name"),
+                    item.get("interface"),
+                    item.get("port"),
+                    item.get("type"),
+                    mfg_product,
+                ]
+                sim_label = next((str(v).strip() for v in label_candidates if v and str(v).strip()), None)
+                if not sim_label:
+                    sim_label = "WIRED WAN"
+                elif sim_label.lower() in ("ethernet", "eth", "ethernet-wan", "ethernet wan", "wan"):
+                    sim_label = "WIRED WAN"
+                elif nd_type and sim_label.lower() == nd_type:
+                    sim_label = nd_type.upper()
 
             conn.execute(
                 """
@@ -7213,24 +7260,27 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
                     net_device_id,
                     router_id,
                     sim_label,
-                    item.get("carrier"),
-                    item.get("connection_state"),
-                    item.get("service_type"),
-                    item.get("mfg_product"),
+                    item.get("carrier") or item.get("name") or item.get("display_name"),
+                    item.get("connection_state") or item.get("state") or item.get("status"),
+                    item.get("service_type") or item.get("type"),
+                    item.get("mfg_product") or item.get("model") or item.get("type"),
                     item.get("updated_at"),
                     item.get("uptime"),
                 ),
             )
 
-            radio_context = {
-                "rfband": item.get("rfband"),
-                "rfband5g": item.get("rfband5g"),
-                "rfchannel": item.get("rfchannel"),
-                "ltebandwidth": item.get("ltebandwidth"),
-                "mtu": item.get("mtu"),
-            }
+            usage_net_devices.append((net_device_id, sim_label))
 
-            mdms.append((net_device_id, sim_label, radio_context))
+            if is_cellular:
+                radio_context = {
+                    "rfband": item.get("rfband"),
+                    "rfband5g": item.get("rfband5g"),
+                    "rfchannel": item.get("rfchannel"),
+                    "ltebandwidth": item.get("ltebandwidth"),
+                    "mtu": item.get("mtu"),
+                }
+
+                mdms.append((net_device_id, sim_label, radio_context))
 
         loc_data = locations.get("data", [])
         location_to_label = None
@@ -7275,10 +7325,11 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
             except Exception as exc:
                 print(f"[signal-samples] Failed polling historical samples router={router_id} net_device={net_device_id} profile={source_profile_id}: {exc}")
 
-            try:
-                await poll_usage_samples(router_id, net_device_id, sim_label, profile_id=source_profile_id)
-            except Exception as exc:
-                print(f"[usage-samples] Failed polling usage samples router={router_id} net_device={net_device_id} profile={source_profile_id}: {exc}")
+    for net_device_id, sim_label in usage_net_devices:
+        try:
+            await poll_usage_samples(router_id, net_device_id, sim_label, profile_id=source_profile_id)
+        except Exception as exc:
+            print(f"[usage-samples] Failed polling usage samples router={router_id} net_device={net_device_id} label={sim_label} profile={source_profile_id}: {exc}")
 
     if include_signal:
         try:
@@ -7287,7 +7338,7 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
             print(f"[router-stream-usage] Failed polling NCM cloud traffic router={router_id} profile={source_profile_id}: {exc}")
 
     evaluate_router_issues(router_id)
-    return {"router_id": router_id, "status": "polled", "include_signal": include_signal, "mdms": len(mdms)}
+    return {"router_id": router_id, "status": "polled", "include_signal": include_signal, "mdms": len(mdms), "usage_net_devices": len(usage_net_devices)}
 
 
 
