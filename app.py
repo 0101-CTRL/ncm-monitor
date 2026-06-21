@@ -17383,8 +17383,8 @@ async function loadRouter() {{
       <button class="primary" onclick="addRouterComment()">Save Note</button>
     </div>
 
-    <h2>SIM / WAN Interfaces</h2>
-    <div class="grid">${{sims || '<div class="card"><p class="small">No SIM data found.</p></div>'}}</div>
+    <h2>WAN Interfaces</h2>
+    <div class="grid">${{sims || '<div class="card"><p class="small">No cellular SIM telemetry observed for this router. Wired WAN telemetry may still be available after net-device discovery and usage polling.</p></div>'}}</div>
 
     ${{renderCellularMobilityCard({{...(cellular || {{}}), recent_events: (cellular?.recent_events || []).filter(e => e.event_type !== '5g_service_mode_change')}})}}
 
@@ -17393,7 +17393,7 @@ async function loadRouter() {{
     ${{mapCard}}
 
     <div class="card">
-      <h2 id="signalChartTitle">30-Day Signal Health — SINR, RSRQ, Cell, and 5G Mode Events</h2>
+      <h2 id="signalChartTitle">30-Day Cellular Signal Health — SINR, RSRQ, Cell, and 5G Mode Events</h2>
       <p class="small">Triangle markers indicate detected cell/tower identity changes. Hover a marker for old/new cell details.</p>
       ${{renderGraphModuleControl('signal_health', 'Signal history polling', 'Controls how often this router collects signal samples used by this graph.')}}
       <div class="chart-range-controls" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 12px 0;">
@@ -17414,12 +17414,12 @@ async function loadRouter() {{
         <span id="signalRangeStatus" class="small"></span>
       </div>
       <div id="signalHistoryNote" class="small" style="display:none;margin:8px 0 10px;color:#facc15;"></div>
-      <div class="chart-box"><canvas id="signalChart"></canvas><div id="signalNoData" class="no-data-overlay">No signal data found</div></div>
+      <div class="chart-box"><canvas id="signalChart"></canvas><div id="signalNoData" class="no-data-overlay">No cellular signal data found</div></div>
     </div>
 
     <div class="card">
       <h2 id="usageChartTitle">30-Day Data Usage</h2>
-      ${{renderGraphModuleControl('sim_usage', 'Carrier/SIM usage polling', 'Controls how often this router collects carrier/SIM usage samples used by this graph.')}}
+      ${{renderGraphModuleControl('sim_usage', 'WAN usage polling', 'Controls how often this router collects WAN interface usage samples used by this graph.')}}
       ${{renderGraphModuleControl('router_stream_usage', 'NCM cloud traffic polling', 'Controls how often this router collects NCM cloud traffic samples used by the optional yellow overlay.')}}
       <div class="chart-range-controls" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 12px 0;">
         <select id="usageRangeSelect" style="max-width:180px;">
@@ -17531,7 +17531,7 @@ async function loadRouter() {{
   const usageTitle = document.getElementById('usageChartTitle');
   const alertTitle = document.getElementById('alertChartTitle');
 
-  if (signalTitle) signalTitle.textContent = '30-Day Signal Health — SINR, RSRQ, Cell, and 5G Mode Events';
+  if (signalTitle) signalTitle.textContent = '30-Day Cellular Signal Health — SINR, RSRQ, Cell, and 5G Mode Events';
   if (usageTitle) usageTitle.textContent = '30-Day Data Usage';
   if (alertTitle) alertTitle.textContent = '30-Day Alert Timeline';
 
