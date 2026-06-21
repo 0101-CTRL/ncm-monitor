@@ -7777,27 +7777,6 @@ def evaluate_router_issues(router_id: str):
                 "No modem WAN is currently connected."
             )
 
-        # Needs Review: daytime reboot during broad business window, unless the router already
-        # has recurring store-power-cycle indicators. A 9-11 AM reboot can be normal store opening
-        # behavior when it repeats consistently across days.
-        latest_reboot = conn.execute("""
-            SELECT created_at FROM alerts
-            WHERE router_id = ?
-              AND type = 'reboot_status_change'
-            ORDER BY created_at DESC
-            LIMIT 1
-        """, (router_id,)).fetchone()
-
-        if latest_reboot and not store_cycle:
-            hour = to_local_hour(latest_reboot[0])
-            if hour is not None and 9 <= hour <= 15:
-                upsert_issue(
-                    conn,
-                    router_id,
-                    "business_hours_reboot",
-                    "needs_review",
-                    "Reboot occurred during the 9 AM - 3 PM local review window."
-                )
 
         # Watch/Needs Review: repeated reboots. If the pattern matches store-power-cycle indicators,
         # keep it out of Watch/Needs Review and classify it separately.
@@ -10819,7 +10798,7 @@ async def mark_expected_store_cycle(router_id: str, payload: dict = Body(default
                 resolution_note = ?
             WHERE router_id = ?
               AND status = 'open'
-              AND issue_type IN ('business_hours_reboot', 'repeated_reboots_12h')
+              AND issue_type IN ('repeated_reboots_12h')
         """, (now_utc(), note, router_id))
 
     return {"status": "marked_expected_store_cycle"}
