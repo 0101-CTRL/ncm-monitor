@@ -3433,7 +3433,25 @@ def init_db():
                 service_type TEXT,
                 mfg_product TEXT,
                 updated_at TEXT,
-                uptime REAL
+                uptime REAL,
+                transport_type TEXT,
+                mode TEXT,
+                type TEXT,
+                uid TEXT,
+                name TEXT,
+                hostname TEXT,
+                ipv4_address TEXT,
+                ipv6_address TEXT,
+                netmask TEXT,
+                gateway TEXT,
+                dns0 TEXT,
+                dns1 TEXT,
+                mac TEXT,
+                port TEXT,
+                mtu TEXT,
+                summary TEXT,
+                model TEXT,
+                manufacturer TEXT
             )
         """)
 
@@ -3667,11 +3685,32 @@ def init_db():
             )
         """)
 
-        # Lightweight migrations for existing Pi databases.
-        try:
-            conn.execute("ALTER TABLE net_devices ADD COLUMN uptime REAL")
-        except sqlite3.OperationalError:
-            pass
+        # Lightweight migrations for existing databases.
+        for col_name, col_type in [
+            ("uptime", "REAL"),
+            ("transport_type", "TEXT"),
+            ("mode", "TEXT"),
+            ("type", "TEXT"),
+            ("uid", "TEXT"),
+            ("name", "TEXT"),
+            ("hostname", "TEXT"),
+            ("ipv4_address", "TEXT"),
+            ("ipv6_address", "TEXT"),
+            ("netmask", "TEXT"),
+            ("gateway", "TEXT"),
+            ("dns0", "TEXT"),
+            ("dns1", "TEXT"),
+            ("mac", "TEXT"),
+            ("port", "TEXT"),
+            ("mtu", "TEXT"),
+            ("summary", "TEXT"),
+            ("model", "TEXT"),
+            ("manufacturer", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE net_devices ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass
 
 
 def seed_default_pools():
@@ -7186,12 +7225,17 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
 
             net_device_id = str(net_device_id_raw)
             nd_type = (item.get("type") or "").strip().lower()
+            nd_mode = (item.get("mode") or "").strip().lower()
+            nd_uid = (item.get("uid") or "").strip().lower()
+            nd_service_type = (item.get("service_type") or "").strip().lower()
             is_cellular = nd_type == "mdm"
 
             mfg_product = item.get("mfg_product") or item.get("model") or ""
 
             nd_text = " ".join(str(v or "") for v in [
                 nd_type,
+                nd_mode,
+                nd_uid,
                 item.get("name"),
                 item.get("display_name"),
                 item.get("interface"),
@@ -7200,12 +7244,17 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
                 item.get("mfg_product"),
                 item.get("model"),
                 item.get("service_type"),
+                item.get("summary"),
             ]).lower()
 
             is_wired_wan = (not is_cellular) and (
-                "wan" in nd_text
-                or "internet" in nd_text
+                (nd_mode == "wan" and nd_type == "ethernet")
+                or (nd_mode == "wan" and nd_service_type == "ethernet")
+                or ("wan" in nd_text and nd_type == "ethernet")
+                or ("internet" in nd_text and nd_type == "ethernet")
             )
+
+            transport_type = "cellular" if is_cellular else ("wired_wan" if is_wired_wan else "unknown")
 
             if not is_cellular and not is_wired_wan:
                 print(
@@ -7252,9 +7301,12 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
                 """
                 INSERT OR REPLACE INTO net_devices(
                     id, router_id, sim_label, carrier, connection_state,
-                    service_type, mfg_product, updated_at, uptime
+                    service_type, mfg_product, updated_at, uptime,
+                    transport_type, mode, type, uid, name, hostname,
+                    ipv4_address, ipv6_address, netmask, gateway, dns0, dns1,
+                    mac, port, mtu, summary, model, manufacturer
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     net_device_id,
@@ -7266,6 +7318,24 @@ async def poll_router(router_id: str, include_signal: bool = False, profile_id=N
                     item.get("mfg_product") or item.get("model") or item.get("type"),
                     item.get("updated_at"),
                     item.get("uptime"),
+                    transport_type,
+                    item.get("mode"),
+                    item.get("type"),
+                    item.get("uid"),
+                    item.get("name"),
+                    item.get("hostname"),
+                    item.get("ipv4_address"),
+                    item.get("ipv6_address"),
+                    item.get("netmask"),
+                    item.get("gateway"),
+                    item.get("dns0"),
+                    item.get("dns1"),
+                    item.get("mac"),
+                    item.get("port"),
+                    item.get("mtu"),
+                    item.get("summary"),
+                    item.get("model"),
+                    item.get("manufacturer"),
                 ),
             )
 
@@ -17354,23 +17424,62 @@ async function loadRouter() {{
   resetTowerMappingMap();
   const content = document.getElementById('content');
 
-  const sims = (data.sims || []).map(s => `
-    <div class="card">
-      <h2>${{s.sim_label || 'SIM'}}</h2>
-      <div class="pill">Carrier: ${{s.carrier || 'Unknown'}}</div>
-      <div class="pill ${{s.connection_state === 'connected' ? 'ok' : 'small'}}">State: ${{s.connection_state || 'Unknown'}}</div>
-      <div class="pill">Service: ${{s.service_type || 'Unknown'}}</div>
-      <div class="pill">Uptime: ${{formatUptime(s.uptime)}}</div>
-      <p class="small">Net Device ID: ${{s.id}}</p>
-      <p class="small">Product: ${{s.mfg_product || ''}}</p>
+  const sims = (data.sims || []).map(s => {{
+    const transport = (s.transport_type || '').toLowerCase();
+    const ndType = (s.type || '').toLowerCase();
+    const ndMode = (s.mode || '').toLowerCase();
+    const service = (s.service_type || '').toLowerCase();
+    const label = (s.sim_label || '').toLowerCase();
+
+    const isWiredWan = transport === 'wired_wan'
+      || (ndMode === 'wan' && ndType === 'ethernet')
+      || (service === 'ethernet' && !label.includes('sim'));
+
+    const isCellular = transport === 'cellular'
+      || ndType === 'mdm'
+      || label.includes('sim')
+      || ['rsrp', 'rsrq', 'sinr', 'mcc', 'mnc', 'tac', 'cell_id'].some(k => s[k] !== null && s[k] !== undefined && s[k] !== '');
+
+    const dnsValues = [s.dns0, s.dns1].filter(v => v !== null && v !== undefined && String(v).trim() !== '');
+
+    const ipContext = isWiredWan ? `
+      <p class="small">Hostname: ${{s.hostname || 'n/a'}}</p>
+      <p class="small">MAC: ${{s.mac || 'n/a'}}${{s.port ? ` | Port: ${{s.port}}` : ''}}${{s.mtu ? ` | MTU: ${{s.mtu}}` : ''}}</p>
+      <p class="small">IPv4 Address: ${{s.ipv4_address || 'n/a'}}${{s.netmask ? ` / ${{s.netmask}}` : ''}}</p>
+      <p class="small">IPv6 Address: ${{s.ipv6_address || 'n/a'}}</p>
+      <p class="small">Gateway: ${{s.gateway || 'n/a'}}</p>
+      <p class="small">DNS: ${{dnsValues.length ? dnsValues.join(', ') : 'n/a'}}</p>
+      <p class="small">Transport source: wired Ethernet</p>
+    ` : '';
+
+    const rfContext = isCellular ? `
       <p class="small">Current RSRP: <span class="${{signalClass('rsrp', s.rsrp)}}">${{s.rsrp ?? 'n/a'}}</span></p>
       <p class="small">Current RSRQ: <span class="${{signalClass('rsrq', s.rsrq)}}">${{s.rsrq ?? 'n/a'}}</span></p>
       <p class="small">Current SINR: <span class="${{signalClass('sinr', s.sinr)}}">${{s.sinr ?? 'n/a'}}</span></p>
       <p class="small">Cell context: MCC ${{s.mcc || 'n/a'}} / MNC ${{s.mnc || 'n/a'}} / TAC ${{s.tac || 'n/a'}} / Cell ${{s.cell_id || 'n/a'}}</p>
-      <p class="small">Updated: ${{s.update_ts || s.updated_at || ''}}</p>
       <p class="small">Signal source: ${{s.signal_source || 'unavailable'}}</p>
-    </div>
-  `).join('');
+    ` : '';
+
+    const genericContext = (!isCellular && !isWiredWan) ? `
+      <p class="small">Transport source: ${{s.transport_type || s.type || s.mode || 'unknown'}}</p>
+    ` : '';
+
+    return `
+      <div class="card">
+        <h2>${{s.sim_label || s.name || 'WAN Interface'}}</h2>
+        <div class="pill">Carrier: ${{s.carrier || s.name || 'Unknown'}}</div>
+        <div class="pill ${{s.connection_state === 'connected' ? 'ok' : 'small'}}">State: ${{s.connection_state || 'Unknown'}}</div>
+        <div class="pill">Service: ${{s.service_type || 'Unknown'}}</div>
+        <div class="pill">Uptime: ${{formatUptime(s.uptime)}}</div>
+        <p class="small">Net Device ID: ${{s.id}}</p>
+        <p class="small">Product: ${{s.mfg_product || s.model || ''}}</p>
+        ${{ipContext}}
+        ${{rfContext}}
+        ${{genericContext}}
+        <p class="small">Updated: ${{s.update_ts || s.updated_at || ''}}</p>
+      </div>
+    `;
+  }}).join('');
 
   const issues = (data.issues || []).map(i => `
     <div class="card">
